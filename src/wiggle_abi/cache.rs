@@ -671,6 +671,15 @@ impl FastlyCache for Session {
         memory: &mut wiggle::GuestMemory<'_>,
         handle: types::CacheHandle,
     ) -> Result<types::CacheHitCount, Error> {
-        Err(Error::NotAvailable("Cache API primitives"))
+        // Viceroy does not track a per-object hit count. Report 0 for a found entry rather than
+        // erroring: the Rust SDK's `Found::hits()` calls `.expect()` on this primitive and traps
+        // the guest on any non-OK status, so returning `NotAvailable` here turns a diagnostic
+        // read into a crash. 0 is the honest "not counted" value and keeps lookups working.
+        let entry = self.cache_entry_mut(handle).await?;
+        if entry.found().is_some() {
+            Ok(0)
+        } else {
+            Err(Error::CacheError(crate::cache::Error::Missing))
+        }
     }
 }
