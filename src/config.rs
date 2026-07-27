@@ -7,7 +7,14 @@ use {
     },
     crate::error::FastlyConfigError,
     serde_derive::Deserialize,
-    std::{collections::HashMap, convert::TryInto, fs, path::Path, str::FromStr, sync::Arc},
+    std::{
+        collections::{HashMap, HashSet},
+        convert::TryInto,
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+    },
     toml::value::Table,
 };
 
@@ -32,7 +39,7 @@ pub use crate::acl::Acls;
 /// Types and deserializers for backend configuration settings.
 mod backends;
 
-pub use self::backends::{Backend, ClientCertError, ClientCertInfo};
+pub use self::backends::{Backend, BackendHealth, ClientCertError, ClientCertInfo};
 
 pub type Backends = HashMap<String, Arc<Backend>>;
 
@@ -56,6 +63,12 @@ mod secret_store;
 pub use crate::secret_store::{SecretStore, SecretStores};
 
 pub use crate::shielding_site::ShieldingSites;
+
+/// A set of fake valid Fastly keys for testing `fastly_key_is_valid`.
+///
+/// Real Fastly API keys should never be used in local testing. These are fake
+/// values used solely to exercise the `fastly_key_is_valid` hostcall in Viceroy.
+pub type FakeValidFastlyKeys = HashSet<String>;
 
 /// Fastly-specific configuration information.
 ///
@@ -129,6 +142,11 @@ impl FastlyConfig {
         &self.local_server.shielding_sites
     }
 
+    /// Get the valid mock Fastly API keys configuration.
+    pub fn fake_valid_fastly_keys(&self) -> &FakeValidFastlyKeys {
+        &self.local_server.fake_valid_fastly_keys
+    }
+
     /// Parse a `fastly.toml` file into a `FastlyConfig`.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, FastlyConfigError> {
         fs::read_to_string(path.as_ref())
@@ -160,9 +178,10 @@ impl FromStr for FastlyConfig {
 /// a [`FastlyConfig`][conf].
 ///
 /// [conf]: struct.FastlyConfig.html
-/// [fromt-str]: https://docs.rs/toml/latest/toml/de/fn.from_str.html
+/// [from-str]: https://docs.rs/toml/latest/toml/de/fn.from_str.html
 #[derive(Deserialize)]
 struct TomlFastlyConfig {
+    manifest_version: Option<u32>,
     local_server: Option<RawLocalServerConfig>,
     // AJT 2020.03.10: the following fields are marked as optional because, for the time being,
     // we are not expecting to actually use the fastly.toml manifest, but instead use a separate
@@ -175,16 +194,30 @@ struct TomlFastlyConfig {
     language: Option<String>,
 }
 
+/// Manifest versions greater than this are not yet supported.
+const MAX_MANIFEST_VERSION: u32 = 3;
+
 impl TryInto<FastlyConfig> for TomlFastlyConfig {
     type Error = FastlyConfigError;
     fn try_into(self) -> Result<FastlyConfig, Self::Error> {
         let Self {
+            manifest_version,
             name,
             description,
             authors,
             language,
             local_server,
         } = self;
+
+        if let Some(manifest_version) = manifest_version
+            && manifest_version > MAX_MANIFEST_VERSION
+        {
+            return Err(FastlyConfigError::UnsupportedManifestVersion(
+                manifest_version,
+                MAX_MANIFEST_VERSION,
+            ));
+        }
+
         let local_server = local_server
             .map(TryInto::try_into)
             .transpose()?
@@ -214,6 +247,7 @@ pub struct LocalServerConfig {
     object_stores: ObjectStoreConfig,
     secret_stores: SecretStoreConfig,
     shielding_sites: ShieldingSites,
+    fake_valid_fastly_keys: FakeValidFastlyKeys,
 }
 
 /// Enum of available (experimental) wasi modules
@@ -238,6 +272,7 @@ struct RawLocalServerConfig {
     object_stores: Option<Table>,
     secret_stores: Option<Table>,
     shielding_sites: Option<Table>,
+    fake_valid_fastly_keys: Option<Vec<String>>,
 }
 
 impl TryInto<LocalServerConfig> for RawLocalServerConfig {
@@ -252,6 +287,7 @@ impl TryInto<LocalServerConfig> for RawLocalServerConfig {
             object_stores,
             secret_stores,
             shielding_sites,
+            fake_valid_fastly_keys,
         } = self;
         let acls = if let Some(acls) = acls {
             acls.try_into()?
@@ -294,6 +330,11 @@ impl TryInto<LocalServerConfig> for RawLocalServerConfig {
             ShieldingSites::default()
         };
 
+        let fake_valid_fastly_keys = fake_valid_fastly_keys
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<FakeValidFastlyKeys>();
+
         Ok(LocalServerConfig {
             acls,
             backends,
@@ -303,6 +344,7 @@ impl TryInto<LocalServerConfig> for RawLocalServerConfig {
             object_stores,
             secret_stores,
             shielding_sites,
+            fake_valid_fastly_keys,
         })
     }
 }

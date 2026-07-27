@@ -151,6 +151,7 @@
         $stale_while_revalidate
         $pci))
 (typename $num_bytes (@witx usize))
+(typename $num_hops (@witx usize))
 (typename $header_count u32)
 (typename $is_done u32)
 (typename $done_idx u32)
@@ -177,6 +178,17 @@
 (typename $bot_detected u32)
 (typename $bot_category_kind u32)
 (typename $bot_verified u32)
+
+(typename $resvpnproxy_is_anonymous u32)
+(typename $resvpnproxy_is_anonymous_vpn u32)
+(typename $resvpnproxy_is_hosting_provider u32)
+(typename $resvpnproxy_is_proxy_over_vpn u32)
+(typename $resvpnproxy_is_public_proxy u32)
+(typename $resvpnproxy_is_relay_proxy u32)
+(typename $resvpnproxy_is_residential_proxy u32)
+(typename $resvpnproxy_is_smart_dns_proxy u32)
+(typename $resvpnproxy_is_tor_exit_node u32)
+(typename $resvpnproxy_is_vpn_datacenter u32)
 
 (typename $content_encodings
     (flags (@witx repr u32)
@@ -296,6 +308,7 @@
         $too_many_requests
         ))
 
+
 (typename $backend_config_options
     (flags (@witx repr u32)
        $reserved
@@ -316,7 +329,24 @@
        $keepalive
        $pooling_limits
        $prefer_ipv4
+       $healthcheck
        ))
+
+(typename $healthcheck_config
+    (record
+        (field $interval_ms u64)
+        (field $timeout_ms u64)
+        (field $host (@witx pointer (@witx char8)))
+        (field $host_len u32)
+        (field $method (@witx pointer (@witx char8)))
+        (field $method_len u32)
+        (field $path (@witx pointer (@witx char8)))
+        (field $path_len u32)
+        (field $expected_status u32)
+        (field $window u32)
+        (field $threshold u32)
+        (field $initial u32)
+    ))
 
 (typename $dynamic_backend_config
   (record
@@ -346,6 +376,7 @@
     (field $max_connections u32)
     (field $max_use u32)
     (field $max_lifetime_ms $timeout_ms)
+    (field $healthcheck (@witx pointer $healthcheck_config))
     ))
 
 ;;; TLS client certificate verified result from downstream.
@@ -580,3 +611,18 @@
         ;; A maximum amount of time to wait for a downstream request to appear, in milliseconds.
         (field $timeout_ms u64)
     ))
+
+;;; Kinds of responses to pending request handles.
+(typename $pending_response_kind
+    (enum (@witx tag u32)
+        ;;; Apply the queued change to the response sent downstream, regardless of whether
+        ;;; it originally came from the origin or was a synthetic 5XX response.
+        $any
+
+        ;;; Only apply the queued change to an actual response to the request.
+        $response
+
+        ;;; Only apply the queued change to the synthetic response made when the request fails.
+        $error
+    )
+)

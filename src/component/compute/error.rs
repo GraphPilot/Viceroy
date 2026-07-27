@@ -1,5 +1,8 @@
 use {
-    crate::component::bindings::fastly::compute::{http_req, kv_store::KvError, types},
+    crate::component::{
+        bindings::fastly::compute::{http_req, kv_store::KvError, types},
+        compute::backend::HealthcheckCreationError,
+    },
     crate::{
         config::ClientCertError,
         error::{self, HandleError},
@@ -106,7 +109,7 @@ impl From<wiggle::GuestError> for types::Error {
             | InvalidFlagValue { .. }
             | InvalidEnumValue { .. }
             | PtrOutOfBounds { .. }
-            | PtrOverflow { .. }
+            | PtrOverflow
             | InvalidUtf8 { .. }
             | TryFromIntError { .. } => types::Error::InvalidArgument,
             // These errors indicate either a pathological user input or an internal programming
@@ -146,9 +149,7 @@ impl From<KvStoreError> for types::Error {
 
 impl From<ResourceTableError> for types::Error {
     fn from(err: ResourceTableError) -> Self {
-        match err {
-            _ => panic!("{}", err),
-        }
+        panic!("{}", err)
     }
 }
 
@@ -198,6 +199,12 @@ impl From<DictionaryError> for types::Error {
     }
 }
 
+impl From<HealthcheckCreationError> for types::Error {
+    fn from(_: HealthcheckCreationError) -> Self {
+        types::Error::InvalidArgument
+    }
+}
+
 impl From<error::Error> for types::Error {
     fn from(err: error::Error) -> Self {
         use error::Error;
@@ -212,6 +219,17 @@ impl From<error::Error> for types::Error {
             Error::HyperError(e) if e.is_user() => types::Error::HttpUser,
             Error::HyperError(e) if e.is_incomplete_message() => types::Error::HttpIncomplete,
             Error::HyperError(_) => types::Error::GenericError,
+            // BackendConnectionError wraps hyper::Error with context
+            Error::BackendConnectionError { source, .. } if source.is_parse() => {
+                types::Error::HttpInvalid
+            }
+            Error::BackendConnectionError { source, .. } if source.is_user() => {
+                types::Error::HttpUser
+            }
+            Error::BackendConnectionError { source, .. } if source.is_incomplete_message() => {
+                types::Error::HttpIncomplete
+            }
+            Error::BackendConnectionError { .. } => types::Error::GenericError,
             // Destructuring a GuestError is recursive, so we use a helper function:
             Error::GuestError(e) => e.into(),
             // We delegate to some error types' own implementation of `to_fastly_status`.
@@ -220,6 +238,7 @@ impl From<error::Error> for types::Error {
             Error::KvStoreError(e) => e.into(),
             Error::SecretStoreError(e) => e.into(),
             Error::CacheError(e) => e.into(),
+            Error::HealthcheckCreationError(e) => e.into(),
             Error::ValueAbsent => panic!("`ValueAbsent` should not be used in components"),
             Error::LimitExceeded { .. } => types::Error::LimitExceeded,
             // All other hostcall errors map to a generic `ERROR` value.
@@ -252,9 +271,15 @@ impl From<error::Error> for types::Error {
             | Error::ObjectStoreKeyValidationError(_)
             | Error::UnfinishedStreamingBody
             | Error::ToStr(_)
-            | Error::InvalidAlpnRepsonse { .. }
+            | Error::InvalidAlpnResponse { .. }
             | Error::DeviceDetectionError(_)
-            | Error::SharedMemory => types::Error::GenericError,
+            | Error::SharedMemory
+            | Error::FirstByteTimeout(_)
+            | Error::BetweenBytesTimeout
+            | Error::TlsNoCAAvailable
+            | Error::TlsNoValidCACerts
+            | Error::TlsInvalidHost
+            | Error::TlsCertificateValidationFailed => types::Error::GenericError,
         }
     }
 }

@@ -4,6 +4,7 @@
 
 use super::{convert_result, FastlyStatus};
 use crate::fastly::decode_ip_address;
+use crate::fastly::dynamic_types::{self, DynamicType};
 use crate::{
     alloc_result, alloc_result_opt, handle_buffer_len, make_vec, with_buffer, write_bool_result,
     TrappingUnwrap,
@@ -83,7 +84,7 @@ pub enum FramingHeadersMode {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u32)]
 pub enum HttpKeepaliveMode {
-    /// This is the default behavor.
+    /// This is the default behavior.
     Automatic = 0,
 
     /// Send `Connection: close` in HTTP/1 and a GOAWAY frame in HTTP/2 and HTTP/3.  This prompts
@@ -164,6 +165,7 @@ pub struct DynamicBackendConfig {
     pub max_connections: u32,
     pub max_use: u32,
     pub max_lifetime_ms: u32,
+    pub healthcheck: *const HealthcheckConfig,
 }
 
 impl Default for DynamicBackendConfig {
@@ -195,6 +197,43 @@ impl Default for DynamicBackendConfig {
             max_connections: 0,
             max_use: 0,
             max_lifetime_ms: 0,
+            healthcheck: std::ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct HealthcheckConfig {
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+
+    pub host: *const u8,
+    pub host_len: u32,
+    pub method: *const u8,
+    pub method_len: u32,
+    pub path: *const u8,
+    pub path_len: u32,
+    pub expected_status: u32,
+    pub window: u32,
+    pub threshold: u32,
+    pub initial: u32,
+}
+
+impl Default for HealthcheckConfig {
+    fn default() -> Self {
+        HealthcheckConfig {
+            interval_ms: 0,
+            timeout_ms: 0,
+            host: std::ptr::null(),
+            host_len: 0,
+            method: std::ptr::null(),
+            method_len: 0,
+            path: std::ptr::null(),
+            path_len: 0,
+            expected_status: 0,
+            window: 0,
+            threshold: 0,
+            initial: 0,
         }
     }
 }
@@ -239,6 +278,7 @@ bitflags::bitflags! {
         const KEEPALIVE = 1 << 15;
         const POOLING_LIMITS = 1 << 16;
         const PREFER_IPV4 = 1 << 17;
+        const HEALTHCHECK = 1 << 18;
     }
 }
 
@@ -670,6 +710,15 @@ pub mod fastly_http_downstream {
                     *main_ptr!(body_handle_out) = res.1.take_handle();
                 }
 
+                // We just created a new `Request` so forget the
+                // recently consumed one.
+                crate::State::with::<FastlyStatus>(|state| {
+                    state
+                        .recently_consumed_image_optimizer_request_handle
+                        .set(INVALID_HANDLE);
+                    Ok(())
+                });
+
                 FastlyStatus::OK
             }
             Ok(None) => {
@@ -1092,13 +1141,13 @@ pub mod fastly_http_downstream {
     #[export_name = "fastly_http_downstream#downstream_bot_detected"]
     pub fn downstream_bot_detected(
         req_handle: RequestHandle,
-        bot_analyzed_out: *mut u32,
+        bot_detected_out: *mut u32,
     ) -> FastlyStatus {
         let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
         match http_downstream::downstream_bot_detected(&req_handle) {
             Ok(res) => {
                 unsafe {
-                    *main_ptr!(bot_analyzed_out) = u32::from(res);
+                    *main_ptr!(bot_detected_out) = u32::from(res);
                 }
                 FastlyStatus::OK
             }
@@ -1183,6 +1232,233 @@ pub mod fastly_http_downstream {
             Err(e) => e.into(),
         }
     }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_anonymous"]
+    pub fn downstream_resvpnproxy_is_anonymous(
+        req_handle: RequestHandle,
+        is_anonymous_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_anonymous(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_anonymous_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_anonymous_vpn"]
+    pub fn downstream_resvpnproxy_is_anonymous_vpn(
+        req_handle: RequestHandle,
+        is_anonymous_vpn_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_anonymous_vpn(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_anonymous_vpn_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_hosting_provider"]
+    pub fn downstream_resvpnproxy_is_hosting_provider(
+        req_handle: RequestHandle,
+        is_hosting_provider_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_hosting_provider(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_hosting_provider_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_proxy_over_vpn"]
+    pub fn downstream_resvpnproxy_is_proxy_over_vpn(
+        req_handle: RequestHandle,
+        is_proxy_over_vpn_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_proxy_over_vpn(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_proxy_over_vpn_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_public_proxy"]
+    pub fn downstream_resvpnproxy_is_public_proxy(
+        req_handle: RequestHandle,
+        is_public_proxy_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_public_proxy(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_public_proxy_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_relay_proxy"]
+    pub fn downstream_resvpnproxy_is_relay_proxy(
+        req_handle: RequestHandle,
+        is_relay_proxy_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_relay_proxy(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_relay_proxy_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_residential_proxy"]
+    pub fn downstream_resvpnproxy_is_residential_proxy(
+        req_handle: RequestHandle,
+        is_residential_proxy_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_residential_proxy(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_residential_proxy_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_smart_dns_proxy"]
+    pub fn downstream_resvpnproxy_is_smart_dns_proxy(
+        req_handle: RequestHandle,
+        is_smart_dns_proxy_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_smart_dns_proxy(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_smart_dns_proxy_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_tor_exit_node"]
+    pub fn downstream_resvpnproxy_is_tor_exit_node(
+        req_handle: RequestHandle,
+        is_tor_exit_node_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_tor_exit_node(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_tor_exit_node_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_is_vpn_datacenter"]
+    pub fn downstream_resvpnproxy_is_vpn_datacenter(
+        req_handle: RequestHandle,
+        is_vpn_datacenter_out: *mut u32,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        match http_downstream::downstream_resvpnproxy_is_vpn_datacenter(&req_handle) {
+            Ok(Some(res)) => {
+                unsafe {
+                    *main_ptr!(is_vpn_datacenter_out) = u32::from(res);
+                }
+                FastlyStatus::OK
+            }
+            Ok(None) => FastlyStatus::NONE,
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_resvpnproxy_vpn_service_name"]
+    pub fn downstream_resvpnproxy_vpn_service_name(
+        req_handle: RequestHandle,
+        vpn_service_name_out: *mut u8,
+        vpn_service_name_max_len: usize,
+        nwritten: *mut usize,
+    ) -> FastlyStatus {
+        let req_handle = ManuallyDrop::new(unsafe { http_req::Request::from_handle(req_handle) });
+        alloc_result_opt!(
+            unsafe_main_ptr!(vpn_service_name_out),
+            vpn_service_name_max_len,
+            main_ptr!(nwritten),
+            {
+                http_downstream::downstream_resvpnproxy_vpn_service_name(
+                    &req_handle,
+                    u64::try_from(vpn_service_name_max_len).trapping_unwrap(),
+                )
+            }
+        )
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_visits_this_service"]
+    pub fn downstream_visits_this_service(count: *mut u32) -> FastlyStatus {
+        match http_downstream::downstream_visits_this_service() {
+            Ok(res) => {
+                unsafe {
+                    *main_ptr!(count) = u32::try_from(res).unwrap_or(u32::MAX);
+                }
+                FastlyStatus::OK
+            }
+            Err(e) => e.into(),
+        }
+    }
+
+    #[export_name = "fastly_http_downstream#downstream_visits_this_pop"]
+    pub fn downstream_visits_this_pop(count: *mut u32) -> FastlyStatus {
+        match http_downstream::downstream_visits_this_pop() {
+            Ok(res) => {
+                unsafe {
+                    *main_ptr!(count) = u32::try_from(res).unwrap_or(u32::MAX);
+                }
+                FastlyStatus::OK
+            }
+            Err(e) => e.into(),
+        }
+    }
 }
 
 pub mod fastly_http_req {
@@ -1193,7 +1469,7 @@ pub mod fastly_http_req {
         bindings::fastly::{
             self,
             adapter::adapter_http_req,
-            compute::{backend, http_req, http_types, security},
+            compute::{backend, http_req, http_resp, http_types, security},
         },
         TrappingUnwrap,
     };
@@ -1207,6 +1483,24 @@ pub mod fastly_http_req {
             const DNS_ERROR_INFO_CODE = 1 << 2;
             const TLS_ALERT_ID = 1 << 3;
             const H2_ERROR = 1 << 4;
+        }
+    }
+
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PendingResponseKind {
+        Any = 0,
+        Response = 1,
+        Error = 2,
+    }
+
+    impl From<PendingResponseKind> for http_resp::PendingResponseKind {
+        fn from(kind: PendingResponseKind) -> Self {
+            match kind {
+                PendingResponseKind::Any => Self::Any,
+                PendingResponseKind::Response => Self::Response,
+                PendingResponseKind::Error => Self::Error,
+            }
         }
     }
 
@@ -1823,6 +2117,16 @@ pub mod fastly_http_req {
                 unsafe {
                     *main_ptr!(req_handle_out) = res.take_handle();
                 }
+
+                // We just created a new `Request` so forget the
+                // recently consumed one.
+                crate::State::with::<FastlyStatus>(|state| {
+                    state
+                        .recently_consumed_image_optimizer_request_handle
+                        .set(INVALID_HANDLE);
+                    Ok(())
+                });
+
                 FastlyStatus::OK
             }
             Err(e) => e.into(),
@@ -2183,6 +2487,46 @@ pub mod fastly_http_req {
         if config_mask.contains(BackendConfigOptions::GRPC) {
             builder.grpc(true);
         }
+        if config_mask.contains(BackendConfigOptions::HEALTHCHECK) {
+            let hcd_config = unsafe_main_ptr!((*config).healthcheck);
+
+            macro_rules! make_hcd_str {
+                ($ptr_field:ident, $len_field:ident) => {
+                    unsafe {
+                        crate::make_str!(
+                            main_ptr!((*hcd_config).$ptr_field),
+                            (*hcd_config).$len_field
+                        )
+                    }
+                };
+            }
+            // Set the strings from HealthcheckConfig first
+            let host = make_hcd_str!(host, host_len);
+            let method = make_hcd_str!(method, method_len);
+            let path = make_hcd_str!(path, path_len);
+
+            let hcd_builder = match backend::HealthcheckOptions::new(host) {
+                Ok(builder) => builder,
+                Err(e) => return e.into(),
+            };
+
+            let result: Result<(), FastlyStatus> = (|| {
+                hcd_builder.method(method)?;
+                hcd_builder.path(path)?;
+                hcd_builder.expected_status(unsafe { (*hcd_config).expected_status as u16 })?;
+                hcd_builder.window(unsafe { (*hcd_config).window })?;
+                hcd_builder.threshold(unsafe { (*hcd_config).threshold })?;
+                hcd_builder.initial(unsafe { (*hcd_config).initial })?;
+                hcd_builder.interval_ms(unsafe { (*hcd_config).interval_ms })?;
+                hcd_builder.timeout_ms(unsafe { (*hcd_config).timeout_ms })?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(_) => builder.healthcheck(hcd_builder),
+                Err(err) => return err.into(),
+            }
+        }
 
         let res = backend::register_dynamic_backend(name_prefix, target, builder);
         let res = res.map(|_backend| ());
@@ -2232,6 +2576,71 @@ pub mod fastly_http_req {
 
             Err(_) => FastlyStatus::INVALID_ARGUMENT,
         }
+    }
+
+    #[export_name = "fastly_http_req#pending_req_header_insert"]
+    fn pending_req_header_insert(
+        pending_req_handle: PendingRequestHandle,
+        name: *const u8,
+        name_len: usize,
+        value: *const u8,
+        value_len: usize,
+        target: PendingResponseKind,
+    ) -> FastlyStatus {
+        let name = unsafe { slice::from_raw_parts(main_ptr!(name), name_len) };
+        let value = unsafe { slice::from_raw_parts(main_ptr!(value), value_len) };
+        let target = http_resp::PendingResponseKind::from(target);
+        let pending_resp_handle = ManuallyDrop::new(unsafe {
+            http_req::PendingResponse::from_handle(pending_req_handle)
+        });
+        convert_result(http_resp::insert_header_pending(
+            &pending_resp_handle,
+            name,
+            value,
+            target,
+        ))
+    }
+
+    #[export_name = "fastly_http_req#pending_req_header_append"]
+    fn pending_req_header_append(
+        pending_req_handle: PendingRequestHandle,
+        name: *const u8,
+        name_len: usize,
+        value: *const u8,
+        value_len: usize,
+        target: PendingResponseKind,
+    ) -> FastlyStatus {
+        let name = unsafe { slice::from_raw_parts(main_ptr!(name), name_len) };
+        let value = unsafe { slice::from_raw_parts(main_ptr!(value), value_len) };
+        let target = http_resp::PendingResponseKind::from(target);
+        let pending_resp_handle = ManuallyDrop::new(unsafe {
+            http_req::PendingResponse::from_handle(pending_req_handle)
+        });
+        convert_result(http_resp::append_header_pending(
+            &pending_resp_handle,
+            name,
+            value,
+            target,
+        ))
+    }
+
+    #[export_name = "fastly_http_req#pending_req_header_remove"]
+    fn pending_req_header_remove(
+        pending_req_handle: PendingRequestHandle,
+        name: *const u8,
+        name_len: usize,
+        target: PendingResponseKind,
+    ) -> FastlyStatus {
+        let name = unsafe { slice::from_raw_parts(main_ptr!(name), name_len) };
+        let target = http_resp::PendingResponseKind::from(target);
+        let pending_resp_handle = ManuallyDrop::new(unsafe {
+            http_req::PendingResponse::from_handle(pending_req_handle)
+        });
+        convert_result(http_resp::remove_header_pending(
+            &pending_resp_handle,
+            name,
+            target,
+        ))
     }
 
     #[export_name = "fastly_http_req#pending_req_poll"]
@@ -2301,7 +2710,7 @@ pub mod fastly_http_req {
         resp_body_handle_out: *mut BodyHandle,
     ) -> FastlyStatus {
         // `http-req.select-request` traps if there are no handles or too many handles; this
-        // check preservs the witx `pending-req-select` behavior.
+        // check preserves the witx `pending-req-select` behavior.
         if pending_req_handles_len == 0
             || pending_req_handles_len >= fastly_shared::MAX_PENDING_REQS as usize
         {
@@ -2331,7 +2740,7 @@ pub mod fastly_http_req {
         resp_body_handle_out: *mut BodyHandle,
     ) -> FastlyStatus {
         // `http-req.select-request` traps if there are no handles or too many handles; this
-        // check preservs the witx `pending-req-select` behavior.
+        // check preserves the witx `pending-req-select` behavior.
         if pending_req_handles_len == 0
             || pending_req_handles_len >= fastly_shared::MAX_PENDING_REQS as usize
         {
@@ -2406,6 +2815,22 @@ pub mod fastly_http_req {
 
     #[export_name = "fastly_http_req#close"]
     pub fn close(req_handle: RequestHandle) -> FastlyStatus {
+        // If `handle` is the handle that we recently consumed in
+        // `cache_busy_handle_wait`, don't close it, as it's already closed.
+        let status = crate::State::with::<FastlyStatus>(|state| {
+            let old = state
+                .recently_consumed_image_optimizer_request_handle
+                .replace(INVALID_HANDLE);
+            if req_handle == old {
+                Err(FastlyStatus::BADF)
+            } else {
+                Ok(())
+            }
+        });
+        if status == FastlyStatus::BADF {
+            return FastlyStatus::OK;
+        }
+
         let req_handle = unsafe { http_req::Request::from_handle(req_handle) };
         convert_result(http_req::close(req_handle))
     }
@@ -2498,7 +2923,8 @@ pub mod fastly_http_resp {
     use core::slice;
 
     use super::*;
-    use crate::bindings::fastly::{self, compute::http_resp};
+    use crate::bindings::fastly;
+    use crate::bindings::fastly::compute::{http_req, http_resp};
     use crate::fastly::encode_ip_address;
 
     #[export_name = "fastly_http_resp#header_append"]
@@ -2690,6 +3116,14 @@ pub mod fastly_http_resp {
             });
             http_resp::send_downstream_streaming(resp_handle, &body_handle)
         };
+        convert_result(res)
+    }
+
+    #[export_name = "fastly_http_resp#send_downstream_pending"]
+    pub fn send_downstream_pending(pending_req_handle: PendingRequestHandle) -> FastlyStatus {
+        let pending_resp_handle =
+            unsafe { http_req::PendingResponse::from_handle(pending_req_handle) };
+        let res = http_resp::send_downstream_pending(pending_resp_handle);
         convert_result(res)
     }
 
@@ -3380,7 +3814,7 @@ pub mod fastly_kv_store {
     #[repr(C)]
     pub struct LookupConfig {
         // reserved is just a placeholder,
-        // can be removed when somethin real is added
+        // can be removed when something real is added
         reserved: u32,
     }
 
@@ -3393,7 +3827,7 @@ pub mod fastly_kv_store {
     #[repr(C)]
     pub struct DeleteConfig {
         // reserved is just a placeholder,
-        // can be removed when somethin real is added
+        // can be removed when something real is added
         reserved: u32,
     }
 
@@ -4494,7 +4928,7 @@ pub mod fastly_acl {
 
 pub mod fastly_async_io {
     use super::*;
-    use crate::bindings::fastly::compute::async_io;
+    use crate::bindings::fastly::compute::{async_io, cache, http_cache};
     use core::slice;
 
     #[export_name = "fastly_async_io#select"]
@@ -4507,12 +4941,15 @@ pub mod fastly_async_io {
         unsafe {
             let refs = slice::from_raw_parts(main_ptr!(async_item_handles), async_item_handles_len);
 
-            // In the witx ABI, a `timeout_ms` value of 0 means no timeout.
-            *main_ptr!(done_index_out) = if timeout_ms == 0 {
-                select_wrapper(refs)
-            } else {
-                select_with_timeout_wrapper(refs, timeout_ms).unwrap_or(u32::MAX)
-            };
+            // If we have any handles that require dynamic typing, handle them
+            // specially.
+            for handle in refs {
+                if !dynamic_types::is_other(*handle) {
+                    return select_with_dynamic_types(refs, timeout_ms, done_index_out);
+                }
+            }
+
+            *main_ptr!(done_index_out) = select_with_maybe_timeout_wrapper(refs, timeout_ms);
 
             FastlyStatus::OK
         }
@@ -4521,10 +4958,149 @@ pub mod fastly_async_io {
     #[export_name = "fastly_async_io#is_ready"]
     pub fn is_ready(async_item_handle: AsyncItemHandle, ready_out: *mut u32) -> FastlyStatus {
         unsafe {
-            let async_item_handle =
-                ManuallyDrop::new(async_io::Pollable::from_handle(async_item_handle));
-            *main_ptr!(ready_out) = async_item_handle.is_ready().into();
+            let is_ready: bool = match first_pollable(async_item_handle) {
+                None => true,
+                Some(pollable) => {
+                    let is_ready = pollable.is_ready();
+                    drop_pollable(async_item_handle, pollable.take_handle());
+                    is_ready
+                }
+            };
+
+            *main_ptr!(ready_out) = is_ready.into();
             FastlyStatus::OK
+        }
+    }
+
+    fn select_with_dynamic_types(
+        refs: &[u32],
+        timeout_ms: u32,
+        done_index_out: *mut u32,
+    ) -> FastlyStatus {
+        crate::State::with::<FastlyStatus>(|state| {
+            unsafe {
+                // Allocate a new handle array.
+                let mut alloc = state.temporary_alloc();
+                let buf = alloc.alloc(
+                    core::mem::align_of::<u32>(),
+                    core::mem::size_of::<u32>() * refs.len(),
+                );
+                let buf = core::slice::from_raw_parts_mut(buf.cast::<u32>(), refs.len());
+
+                // For each handle with a dynamic type that isn't a `pollable`,
+                // call `.step()` to obtain a `pollable`.
+                for i in 0..refs.len() {
+                    let new = match first_pollable(refs[i]) {
+                        Some(new) => new,
+                        None => {
+                            // The handle is ready already.
+                            *main_ptr!(done_index_out) = i as u32;
+
+                            // Free the `pollable`s we created.
+                            for i in 0..i {
+                                drop_pollable(refs[i], buf[i]);
+                            }
+
+                            return Ok(());
+                        }
+                    };
+                    buf[i] = new.take_handle();
+                }
+
+                loop {
+                    // Wait for an event on any of the handles.
+                    let done_index = select_with_maybe_timeout_wrapper(buf, timeout_ms);
+                    let i = done_index as usize;
+                    if i >= refs.len() {
+                        // The host returned an invalid handle!
+                        // That's not entirely unexpected; we get 0xFF.. if it hits the timeout
+                        // before any handle becomes ready.
+                        //
+                        // Report that back to the user; break the loop.
+                        *main_ptr!(done_index_out) = done_index;
+                        break;
+                    }
+
+                    // One step of `handle` completed, but there may be more steps.
+                    match next_pollable(refs[i]) {
+                        Some(pollable) => {
+                            drop_pollable(refs[i], buf[i]);
+                            buf[i] = pollable.take_handle();
+                        }
+                        None => {
+                            // We're done here.
+                            *main_ptr!(done_index_out) = done_index;
+                            break;
+                        }
+                    }
+                }
+
+                // Free the `pollable`s we created.
+                for i in 0..refs.len() {
+                    drop_pollable(refs[i], buf[i]);
+                }
+
+                Ok(())
+            }
+        })
+    }
+
+    /// Call the host select facility.
+    ///
+    /// `hs` must contain a list of host `pollable` handles. Handles of
+    /// any other type must be converted to `pollable` first, such as with
+    /// `.step()` methods.
+    ///
+    /// This function only does a single wait, so if a resource requires
+    /// multiple `.step()`s, this function must be called multiple times.
+    ///
+    /// If `timeout` is 0, no timeout is applied.
+    fn select_with_maybe_timeout_wrapper(hs: &[u32], timeout_ms: u32) -> u32 {
+        // In the witx ABI, a `timeout_ms` value of 0 means no timeout.
+        if timeout_ms == 0 {
+            select_wrapper(hs)
+        } else {
+            select_with_timeout_wrapper(hs, timeout_ms).unwrap_or(u32::MAX)
+        }
+    }
+
+    /// Return the first `Pollable` for `handle` that a `select` should wait
+    /// for, or `None` if the handle is already ready.
+    unsafe fn first_pollable(handle: AsyncItemHandle) -> Option<async_io::Pollable> {
+        match dynamic_types::parts(handle) {
+            (DynamicType::Other, _) => Some(async_io::Pollable::from_handle(handle)),
+            (DynamicType::CacheEntry, raw) => {
+                ManuallyDrop::new(cache::Entry::from_handle(raw)).step()
+            }
+            (DynamicType::CacheReplaceEntry, raw) => {
+                ManuallyDrop::new(cache::ReplaceEntry::from_handle(raw)).step()
+            }
+            (DynamicType::HttpCacheEntry, raw) => {
+                ManuallyDrop::new(http_cache::Entry::from_handle(raw)).step()
+            }
+        }
+    }
+
+    /// If `handle` requires further steps, return a `Pollable` for the next
+    /// step.
+    unsafe fn next_pollable(handle: AsyncItemHandle) -> Option<async_io::Pollable> {
+        match dynamic_types::parts(handle) {
+            (DynamicType::Other, _) => None,
+            (DynamicType::CacheEntry, raw) => {
+                ManuallyDrop::new(cache::Entry::from_handle(raw)).step()
+            }
+            (DynamicType::CacheReplaceEntry, raw) => {
+                ManuallyDrop::new(cache::ReplaceEntry::from_handle(raw)).step()
+            }
+            (DynamicType::HttpCacheEntry, raw) => {
+                ManuallyDrop::new(http_cache::Entry::from_handle(raw)).step()
+            }
+        }
+    }
+
+    unsafe fn drop_pollable(handle: AsyncItemHandle, pollable: AsyncItemHandle) {
+        if !dynamic_types::is_other(handle) {
+            drop(async_io::Pollable::from_handle(pollable));
         }
     }
 }
@@ -4618,6 +5194,7 @@ pub mod fastly_shielding {
             const RESERVED = 1 << 0;
             const CACHE_KEY = 1 << 1;
             const FIRST_BYTE_TIMEOUT = 1 << 2;
+            const BETWEEN_BYTES_TIMEOUT = 1 << 3;
         }
     }
 
@@ -4626,6 +5203,7 @@ pub mod fastly_shielding {
         pub cache_key: *const u8,
         pub cache_key_len: u32,
         pub first_byte_timeout_ms: u32,
+        pub between_bytes_timeout: u32,
     }
 
     impl Default for ShieldBackendConfig {
@@ -4634,6 +5212,7 @@ pub mod fastly_shielding {
                 cache_key: std::ptr::null(),
                 cache_key_len: 0,
                 first_byte_timeout_ms: 0,
+                between_bytes_timeout: 0,
             }
         }
     }
@@ -4710,6 +5289,10 @@ pub mod fastly_shielding {
             if options_mask.contains(ShieldBackendOptions::FIRST_BYTE_TIMEOUT) {
                 adapted_options.set_first_byte_timeout(unsafe { (*options).first_byte_timeout_ms });
             }
+            if options_mask.contains(ShieldBackendOptions::BETWEEN_BYTES_TIMEOUT) {
+                adapted_options
+                    .set_between_bytes_timeout(unsafe { (*options).between_bytes_timeout });
+            }
             if options_mask.contains(ShieldBackendOptions::CACHE_KEY) {
                 let s = unsafe {
                     crate::make_slice!(main_ptr!((*options).cache_key), (*options).cache_key_len)
@@ -4720,7 +5303,7 @@ pub mod fastly_shielding {
             Some(adapted_options)
         };
         // We allow the ShieldBackendOptions Resource to drop at the end of this call;
-        // we don't need it any more, and it has no heap allocations.
+        // we don't need it anymore, and it has no heap allocations.
 
         let res = host::backend_for_shield(name, adapted_options.as_ref());
 
@@ -4810,7 +5393,7 @@ mod fastly_image_optimizer {
 
     #[export_name = "fastly_image_optimizer#transform_image_optimizer_request"]
     pub fn transform_image_optimizer_request(
-        req_handle: RequestHandle,
+        raw_req_handle: RequestHandle,
         body_handle: BodyHandle,
         origin_image_backend: *const u8,
         origin_image_backend_len: usize,
@@ -4835,9 +5418,9 @@ mod fastly_image_optimizer {
                 Some(crate::bindings::fastly::compute::http_body::Body::from_handle(body_handle))
             }
         };
-        let req_handle = ManuallyDrop::new(unsafe {
-            crate::bindings::fastly::compute::http_req::Request::from_handle(req_handle)
-        });
+        let req_handle = unsafe {
+            crate::bindings::fastly::compute::http_req::Request::from_handle(raw_req_handle)
+        };
 
         let io_transform_config = unsafe_main_ptr!(io_transform_config);
         macro_rules! make_string {
@@ -4865,12 +5448,17 @@ mod fastly_image_optimizer {
             extra: None,
         };
 
-        let res = image_optimizer::transform_image_optimizer_request(
-            &req_handle,
-            body_handle,
-            &backend,
-            &options,
-        );
+        let res =
+            image_optimizer::send_to_image_optimizer(req_handle, body_handle, &backend, &options);
+
+        // Remember that we just consumed `req_handle` so that if there's
+        // a subsequent call to `close`, we can avoid double-closing it.
+        crate::State::with::<FastlyStatus>(|state| {
+            state
+                .recently_consumed_image_optimizer_request_handle
+                .set(raw_req_handle);
+            Ok(())
+        });
 
         std::mem::forget(options);
 

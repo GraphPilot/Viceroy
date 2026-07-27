@@ -476,6 +476,55 @@
         (result $err (expected $pending_request_handle (error $fastly_status)))
     )
 
+    ;;; Sets a response header to the given value on a pending response.
+    ;;;
+    ;;; This will discard any previous values for the given header name, including any
+    ;;; pending header changes previously queued via other `pending_req_header_insert`
+    ;;; or `pending_req_header_append` calls for the same header name.
+    ;;;
+    ;;; When using `send_downstream_pending`, the pending header changes will also
+    ;;; be applied to the synthetic 5XX response generated in the event of a backend
+    ;;; request error.
+    (@interface func (export "pending_req_header_insert")
+        (param $h $pending_request_handle)
+        (param $name (list u8))
+        (param $value (list u8))
+        (param $target $pending_response_kind)
+        (result $err (expected (error $fastly_status)))
+    )
+
+    ;;; Adds a response header with given value to a pending response.
+    ;;;
+    ;;; Unlike `pending_req_header_insert`, this does not discard existing values for
+    ;;; the same header name, but will instead result in multiple headers of the
+    ;;; same name in the final response, each with their own values.
+    ;;;
+    ;;; When using `send_downstream_pending`, the pending header changes will also
+    ;;; be applied to the synthetic 5XX response generated in the event of a backend
+    ;;; request error.
+    (@interface func (export "pending_req_header_append")
+        (param $h $pending_request_handle)
+        (param $name (list u8))
+        (param $value (list u8))
+        (param $target $pending_response_kind)
+        (result $err (expected (error $fastly_status)))
+    )
+
+    ;;; Removes all response headers of the given name from a pending response.
+    ;;;
+    ;;; This will also remove any changes previously queued via `pending_req_header_insert`
+    ;;; or `pending_req_header_append` for the same header name.
+    ;;;
+    ;;; When using `send_downstream_pending`, the pending header changes will also
+    ;;; be applied to the synthetic 5XX response generated in the event of a backend
+    ;;; request error.
+    (@interface func (export "pending_req_header_remove")
+        (param $h $pending_request_handle)
+        (param $name (list u8))
+        (param $target $pending_response_kind)
+        (result $err (expected (error $fastly_status)))
+    )
+
     (@interface func (export "pending_req_poll")
         (param $h $pending_request_handle)
         (result $err (expected
@@ -802,6 +851,70 @@
         (param $req $request_handle)
         (result $err (expected $bot_verified (error $fastly_status)))
     )
+
+    (@interface func (export "downstream_resvpnproxy_is_anonymous")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_anonymous (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_anonymous_vpn")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_anonymous_vpn (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_hosting_provider")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_hosting_provider (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_proxy_over_vpn")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_proxy_over_vpn (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_public_proxy")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_public_proxy (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_relay_proxy")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_relay_proxy (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_residential_proxy")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_residential_proxy (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_smart_dns_proxy")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_smart_dns_proxy (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_tor_exit_node")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_tor_exit_node (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_is_vpn_datacenter")
+        (param $req $request_handle)
+        (result $err (expected $resvpnproxy_is_vpn_datacenter (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_resvpnproxy_vpn_service_name")
+        (param $req $request_handle)
+        (param $vpn_service_name_out (@witx pointer (@witx char8)))
+        (param $vpn_service_name_max_len (@witx usize))
+        (param $nwritten_out (@witx pointer (@witx usize)))
+        (result $err (expected (error $fastly_status)))
+    )
+
+    (@interface func (export "downstream_visits_this_service")
+        (result $err (expected $num_hops (error $fastly_status))))
+
+    (@interface func (export "downstream_visits_this_pop")
+        (result $err (expected $num_hops (error $fastly_status))))
 )
 
 (module $fastly_http_resp
@@ -885,6 +998,18 @@
         (param $h $response_handle)
         (param $b $body_handle)
         (param $streaming u32)
+        (result $err (expected (error $fastly_status)))
+    )
+
+    ;;; Use a pending request handle to send a downstream response.
+    ;;;
+    ;;; This will cause Compute to wait in the background for the pending request handle to
+    ;;; resolve into its response headers and body, and then forward them back downstream.
+    ;;;
+    ;;; If the pending request fails while sending and a response never materializes, Compute
+    ;;; will generate a 5XX response to send in its stead.
+    (@interface func (export "send_downstream_pending")
+        (param $handle $pending_request_handle)
         (result $err (expected (error $fastly_status)))
     )
 
@@ -1088,6 +1213,9 @@
 )
 
 (module $fastly_image_optimizer
+    ;; Sends a request to Image Optimizer.
+    ;;
+    ;; The `origin_image_request` resource is consumed, and may not be used afterwards.
     (@interface func (export "transform_image_optimizer_request")
         (param $origin_image_request $request_handle)
         (param $origin_image_request_body $body_handle)

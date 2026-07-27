@@ -19,6 +19,9 @@ pub(crate) mod bindings {
             // The trap-test test depends on being able to induce an artificial
             // trap in `get-header-values`.
             "fastly:compute/http-resp.[method]response.get-header-values": tracing | trappable,
+            "fastly:compute/shielding.[method]shield-backend-options.set-first-byte-timeout": tracing | trappable,
+            "fastly:compute/shielding.[method]shield-backend-options.set-between-bytes-timeout": tracing | trappable,
+
 
             "fastly:compute/http-body.append": async | tracing,
             "fastly:compute/kv-store.await-delete": async | tracing,
@@ -28,6 +31,11 @@ pub(crate) mod bindings {
             "fastly:compute/kv-store.await-lookup": async | tracing | trappable,
             "fastly:compute/http-downstream.await-request": async | tracing,
             "fastly:compute/http-req.await-response": async | tracing,
+            "fastly:compute/http-req.[method]request.redirect-to-grip-proxy": async | tracing,
+            "fastly:compute/http-req.[method]request.redirect-to-websocket-proxy": async | tracing,
+            "fastly:compute/http-resp.send-downstream": async | tracing,
+            "fastly:compute/http-resp.send-downstream-streaming": async | tracing,
+            "fastly:compute/http-resp.send-downstream-pending": async | tracing,
             "fastly:compute/cache.close-entry": async | tracing,
             "fastly:compute/cache.close-replace-entry": async | tracing,
             "fastly:compute/cache.insert": async | tracing,
@@ -40,6 +48,7 @@ pub(crate) mod bindings {
             "fastly:compute/cache.[method]replace-entry.get-stale-while-revalidate-ns": async | tracing,
             "fastly:compute/cache.[method]replace-entry.get-state": async | tracing,
             "fastly:compute/cache.[method]replace-entry.get-user-metadata": async | tracing,
+            "fastly:compute/cache.[method]replace-entry.step": tracing | trappable,
             "fastly:compute/cache.replace-insert": async | tracing,
             "fastly:compute/cache.[method]entry.get-age-ns": async | tracing,
             "fastly:compute/cache.[method]entry.get-body": async | tracing,
@@ -49,10 +58,12 @@ pub(crate) mod bindings {
             "fastly:compute/cache.[method]entry.get-stale-while-revalidate-ns": async | tracing,
             "fastly:compute/cache.[method]entry.get-state": async | tracing,
             "fastly:compute/cache.[method]entry.get-user-metadata": async | tracing,
+            "fastly:compute/cache.[method]entry.step": tracing | trappable,
             "fastly:compute/cache.[method]entry.transaction-cancel": async | tracing,
             "fastly:compute/cache.[method]entry.transaction-insert": async | tracing,
             "fastly:compute/cache.[method]entry.transaction-insert-and-stream-back": async | tracing,
             "fastly:compute/cache.[method]entry.transaction-update": async | tracing,
+            "fastly:compute/http-cache.[method]entry.step": tracing | trappable,
             "fastly:compute/kv-store.[method]store.delete": async | tracing,
             "fastly:compute/kv-store.[method]store.delete-async": async | tracing,
             "fastly:compute/kv-store.[method]store.insert": async | tracing,
@@ -110,10 +121,12 @@ pub(crate) mod bindings {
 
             "fastly:compute/kv-store.entry": super::compute::kv_store::Entry,
             "fastly:compute/backend.dynamic-backend-options": super::compute::backend::BackendBuilder,
+            "fastly:compute/backend.healthcheck-options": super::compute::backend::HealthcheckBuilder,
             "fastly:compute/backend.backend": String,
             "fastly:compute/erl.rate-counter": String,
             "fastly:compute/erl.penalty-box": String,
             "fastly:compute/http-downstream.extra-bot-category": super::compute::http_downstream::ExtraBotCategory,
+            "fastly:compute/shielding.shield-backend-options": super::compute::shielding::ShieldBackendOptions,
         },
 
         trappable_error_type: {

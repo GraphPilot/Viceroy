@@ -20,7 +20,7 @@ use {
         fastly_abi::FastlyAbi,
         types::{FastlyStatus, UserErrorConversion},
     },
-    crate::{error::Error, session::Session},
+    crate::{error::Error, sandbox::Sandbox},
     tracing::{Level, event},
     wiggle::{GuestErrorType, GuestMemory, GuestPtr},
 };
@@ -91,7 +91,9 @@ wiggle::from_witx!({
         fastly_http_req::{
             pending_req_select, pending_req_select_v2, pending_req_poll, pending_req_poll_v2,
             pending_req_wait, pending_req_wait_v2, send, send_v2, send_v3, send_async, send_async_v2, send_async_streaming,
+            redirect_to_websocket_proxy, redirect_to_grip_proxy, redirect_to_websocket_proxy_v2, redirect_to_grip_proxy_v2,
         },
+        fastly_http_resp::{send_downstream, send_downstream_pending},
         fastly_image_optimizer::transform_image_optimizer_request,
     }
 });
@@ -194,7 +196,7 @@ impl TryFrom<http::version::Version> for types::HttpVersion {
     }
 }
 
-impl FastlyAbi for Session {
+impl FastlyAbi for Sandbox {
     fn init(&mut self, _memory: &mut GuestMemory<'_>, abi_version: u64) -> Result<(), Error> {
         if abi_version != ABI_VERSION {
             Err(Error::AbiVersionMismatch)
@@ -204,7 +206,7 @@ impl FastlyAbi for Session {
     }
 }
 
-impl UserErrorConversion for Session {
+impl UserErrorConversion for Sandbox {
     fn fastly_status_from_error(&mut self, e: Error) -> Result<FastlyStatus, anyhow::Error> {
         match e {
             Error::UnknownBackend(ref backend) => {

@@ -1,6 +1,10 @@
 //! Error types.
 
-use crate::{pushpin::PushpinRedirectInfo, wiggle_abi::types::FastlyStatus};
+use crate::{
+    component::compute::backend::HealthcheckCreationError, handoff::HandoffInfo,
+    wiggle_abi::types::FastlyStatus,
+};
+use hyper::StatusCode;
 use std::error::Error as StdError;
 use std::io;
 use url::Url;
@@ -46,6 +50,17 @@ pub enum Error {
 
     #[error(transparent)]
     HyperError(#[from] hyper::Error),
+
+    #[error(transparent)]
+    HealthcheckCreationError(#[from] HealthcheckCreationError),
+
+    #[error("Backend connection error for '{backend_name}' ({uri}): {source}")]
+    BackendConnectionError {
+        backend_name: String,
+        uri: String,
+        #[source]
+        source: hyper::Error,
+    },
 
     #[error(transparent)]
     Infallible(#[from] std::convert::Infallible),
@@ -124,6 +139,18 @@ pub enum Error {
     #[error("Could not load native certificates: {0}")]
     BadCerts(std::io::Error),
 
+    #[error("No CA certificates available")]
+    TlsNoCAAvailable,
+
+    #[error("No valid CA certificates found in provided certificate bundle")]
+    TlsNoValidCACerts,
+
+    #[error("Invalid or missing host for TLS connection")]
+    TlsInvalidHost,
+
+    #[error("TLS certificate validation failed")]
+    TlsCertificateValidationFailed,
+
     #[error("Could not generate new backend name from '{0}'")]
     BackendNameRegistryError(String),
 
@@ -152,16 +179,61 @@ pub enum Error {
     InvalidClientCert(#[from] crate::config::ClientCertError),
 
     #[error("Invalid response to ALPN request; wanted '{0}', got '{1}'")]
-    InvalidAlpnRepsonse(&'static str, String),
+    InvalidAlpnResponse(&'static str, String),
 
     #[error("Resource temporarily unavailable")]
     Again,
 
     #[error("cache error: {0}")]
     CacheError(crate::cache::Error),
+
+    #[error("Timed out waiting for first byte of response: {0}")]
+    FirstByteTimeout(tokio::time::error::Elapsed),
+
+    #[error("Timed out waiting for an internal byte of response")]
+    BetweenBytesTimeout,
 }
 
 impl Error {
+    /// Map this error onto an appropriate 5XX response code during proxying.
+    pub fn as_status_code(&self) -> StatusCode {
+        match self {
+            Self::FirstByteTimeout(_) | Self::BetweenBytesTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::HyperError(e) => {
+                if e.is_timeout() {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            }
+
+            Self::BackendUrl(..)
+            | Self::BackendConnectionError { .. }
+            | Self::InvalidArgument
+            | Self::InvalidHeaderName(..)
+            | Self::InvalidHeaderValue(..)
+            | Self::InvalidMethod(..)
+            | Self::InvalidStatusCode(..)
+            | Self::InvalidUri(..)
+            | Self::IoError(..)
+            | Self::MissingDownstreamMetadata
+            | Self::StreamingChunkSend
+            | Self::UnknownBackend(..)
+            | Self::BadCerts(..)
+            | Self::TlsNoCAAvailable
+            | Self::TlsNoValidCACerts
+            | Self::TlsInvalidHost
+            | Self::TlsCertificateValidationFailed
+            | Self::HttpError(..)
+            | Self::UnfinishedStreamingBody
+            | Self::InvalidClientCert(..)
+            | Self::InvalidAlpnResponse(..)
+            | Self::CacheError(..) => StatusCode::BAD_GATEWAY,
+
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
     /// Convert to an error code representation suitable for passing across the ABI boundary.
     ///
     /// For more information about specific error codes see [`fastly_shared::FastlyStatus`][status],
@@ -171,7 +243,7 @@ impl Error {
     pub fn to_fastly_status(&self) -> FastlyStatus {
         match self {
             Error::BufferLengthError { .. } => FastlyStatus::Buflen,
-            Error::InvalidArgument => FastlyStatus::Inval,
+            Error::InvalidArgument | Error::HealthcheckCreationError(_) => FastlyStatus::Inval,
             Error::ValueAbsent => FastlyStatus::None,
             Error::Unsupported { .. } | Error::NotAvailable(_) => FastlyStatus::Unsupported,
             Error::HandleError { .. } => FastlyStatus::Badf,
@@ -190,6 +262,26 @@ impl Error {
                 FastlyStatus::Httpincomplete
             }
             Error::HyperError(_) => FastlyStatus::Error,
+            // BackendConnectionError contains detailed context but maps to same status as HyperError
+            Error::BackendConnectionError { source, .. } if source.is_parse() => {
+                FastlyStatus::Httpinvalid
+            }
+            Error::BackendConnectionError { source, .. } if source.is_user() => {
+                FastlyStatus::Httpuser
+            }
+            Error::BackendConnectionError { source, .. } if source.is_incomplete_message() => {
+                FastlyStatus::Httpincomplete
+            }
+            Error::BackendConnectionError { source, .. }
+                if source
+                    .source()
+                    .and_then(|e| e.downcast_ref::<io::Error>())
+                    .map(|ioe| ioe.kind())
+                    == Some(io::ErrorKind::UnexpectedEof) =>
+            {
+                FastlyStatus::Httpincomplete
+            }
+            Error::BackendConnectionError { .. } => FastlyStatus::Error,
             // Destructuring a GuestError is recursive, so we use a helper function:
             Error::GuestError(e) => Self::guest_error_fastly_status(e),
             // We delegate to some error types' own implementation of `to_fastly_status`.
@@ -205,6 +297,10 @@ impl Error {
             Error::AbiVersionMismatch
             | Error::BackendUrl(_)
             | Error::BadCerts(_)
+            | Error::TlsNoCAAvailable
+            | Error::TlsNoValidCACerts
+            | Error::TlsInvalidHost
+            | Error::TlsCertificateValidationFailed
             | Error::DownstreamRequestError(_)
             | Error::DownstreamRespSending
             | Error::FastlyConfig(_)
@@ -228,7 +324,9 @@ impl Error {
             | Error::UnfinishedStreamingBody
             | Error::SharedMemory
             | Error::ToStr(_)
-            | Error::InvalidAlpnRepsonse(_, _) => FastlyStatus::Error,
+            | Error::FirstByteTimeout(_)
+            | Error::BetweenBytesTimeout
+            | Error::InvalidAlpnResponse(_, _) => FastlyStatus::Error,
         }
     }
 
@@ -241,7 +339,7 @@ impl Error {
             InvalidFlagValue { .. }
             | InvalidEnumValue { .. }
             | PtrOutOfBounds { .. }
-            | PtrOverflow { .. }
+            | PtrOverflow
             | InvalidUtf8 { .. }
             | TryFromIntError { .. } => FastlyStatus::Inval,
             // These errors indicate either a pathological user input or an internal programming
@@ -429,14 +527,10 @@ pub enum FastlyConfigError {
     #[error("error parsing `fastly.toml`: {0}")]
     InvalidFastlyToml(#[from] toml::de::Error),
 
-    /// An error caused by an invalid manifest version.
-    ///
-    /// This means that the provided version is not compliant with the semver spec. See the
-    /// documentation of [`semver::Version::parse`][parse-errors] for more information.
-    ///
-    /// [parse-errors]: https://docs.rs/semver/latest/semver/struct.Version.html#errors
-    #[error("invalid manifest version: {0}")]
-    InvalidManifestVersion(#[from] semver::SemVerError),
+    /// The `manifest_version` field contained a value greater than is
+    /// currently supported.
+    #[error("unsupported manifest version {0}; max supported version is {1}")]
+    UnsupportedManifestVersion(u32, u32),
 }
 
 /// Errors that may occur while validating acl configurations.
@@ -490,6 +584,11 @@ pub enum BackendConfigError {
     #[error("'grpc' field was not a boolean")]
     InvalidGrpcEntry,
 
+    #[error(
+        "'health' field has invalid value '{0}' (expected 'unknown', 'healthy', or 'unhealthy')"
+    )]
+    InvalidHealthEntry(String),
+
     #[error("invalid url: {0}")]
     InvalidUrl(#[from] http::uri::InvalidUri),
 
@@ -507,6 +606,9 @@ pub enum BackendConfigError {
 
     #[error(transparent)]
     ClientCertError(#[from] crate::config::ClientCertError),
+
+    #[error("Illegal timeout value (must be an integer >= 0)")]
+    InvalidTimeoutValue,
 }
 
 /// Errors that may occur while validating dictionary configurations.
@@ -586,7 +688,7 @@ pub enum DictionaryConfigError {
 /// Errors that may occur while validating device detection configurations.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceDetectionConfigError {
-    /// An I/O error that occured while reading the file.
+    /// An I/O error that occurred while reading the file.
     #[error(transparent)]
     IoError(std::io::Error),
 
@@ -642,7 +744,7 @@ pub enum DeviceDetectionConfigError {
 /// Errors that may occur while validating geolocation configurations.
 #[derive(Debug, thiserror::Error)]
 pub enum GeolocationConfigError {
-    /// An I/O error that occured while reading the file.
+    /// An I/O error that occurred while reading the file.
     #[error(transparent)]
     IoError(std::io::Error),
 
@@ -701,7 +803,7 @@ pub enum GeolocationConfigError {
 /// Errors that may occur while validating object store configurations.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreConfigError {
-    /// An I/O error that occured while reading the file.
+    /// An I/O error that occurred while reading the file.
     #[error(transparent)]
     IoError(std::io::Error),
     #[error("The `file` and `data` keys for the object `{0}` are set. Only one can be used.")]
@@ -753,7 +855,7 @@ pub enum ObjectStoreConfigError {
 /// Errors that may occur while validating secret store configurations.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretStoreConfigError {
-    /// An I/O error that occured while reading the file.
+    /// An I/O error that occurred while reading the file.
     #[error(transparent)]
     IoError(std::io::Error),
 
@@ -799,7 +901,7 @@ pub enum SecretStoreConfigError {
 #[derive(Debug, thiserror::Error)]
 pub enum ShieldingSiteConfigError {
     #[error(
-        "Illegal TOML value for shielding site; must be either the string 'local' or a table containin an encrypted and unencrypted URL."
+        "Illegal TOML value for shielding site; must be either the string 'local' or a table containing an encrypted and unencrypted URL."
     )]
     IllegalSiteValue,
 
@@ -829,9 +931,8 @@ pub enum DownstreamRequestError {
 /// HTTP response, but instead signals for a different action.
 #[derive(Debug, thiserror::Error)]
 pub enum NonHttpResponse {
-    #[error("graceful Pushpin redirect")]
-    PushpinRedirect(PushpinRedirectInfo),
-    // In the future, e.g.
-    // #[error("websocket upgrade requested")]
-    // WebSocketUpgrade(WebSocketUpgradeInfo),
+    #[error("graceful Pushpin handoff")]
+    HandoffToPushpin(HandoffInfo),
+    #[error("graceful Backend handoff")]
+    HandoffToBackend(HandoffInfo),
 }

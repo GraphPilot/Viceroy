@@ -3,10 +3,11 @@ use std::net::SocketAddr;
 
 use crate::body::Body;
 use crate::error::DownstreamRequestError;
-use crate::pushpin::PushpinRedirectInfo;
+use crate::handoff::HandoffInfo;
+use crate::sandbox::PendingResponse;
 use http::{HeaderMap, Request, Response};
 use hyper::Uri;
-use tokio::sync::oneshot::Sender;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug)]
 pub struct DownstreamMetadata {
@@ -18,7 +19,7 @@ pub struct DownstreamMetadata {
     pub client_addr: SocketAddr,
     /// The compliance region that this request was received in.
     ///
-    /// For now this is just always `"none"`, but we place the field in the session
+    /// For now this is just always `"none"`, but we place the field in the sandbox
     /// to make it easier to implement custom configuration values later on.
     pub compliance_region: String,
     /// The originally received headers in this request, before the
@@ -33,10 +34,39 @@ pub struct DownstreamRequest {
     pub sender: Sender<DownstreamResponse>,
 }
 
+impl DownstreamRequest {
+    pub fn new(
+        req: hyper::Request<Body>,
+        metadata: DownstreamMetadata,
+    ) -> (Self, Receiver<DownstreamResponse>) {
+        let (sender, receiver) = mpsc::channel(10);
+        let req = Self {
+            req,
+            metadata,
+            sender,
+        };
+
+        (req, receiver)
+    }
+}
+
 #[derive(Debug)]
 pub enum DownstreamResponse {
+    /// An HTTP response to send back downstream.
     Http(Response<Body>),
-    RedirectToPushpin(PushpinRedirectInfo),
+
+    /// A potential [Response] to an in-flight request that should be sent
+    /// downstream once it resolves.
+    ///
+    /// If the in-flight request fails, then the `Error` will be converted
+    /// to an appropriate 5XX HTTP status code.
+    Pending(Box<PendingResponse>),
+
+    /// Redirect the WebSocket request to pushpin.
+    HandoffToPushpin(HandoffInfo),
+
+    /// Redirect the WebSocket request to a backend.
+    HandoffToBackend(HandoffInfo),
 }
 
 /// Canonicalize the incoming request into the form expected by host calls.

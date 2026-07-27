@@ -1,7 +1,7 @@
 [package]
 name = "viceroy"
 description = "Viceroy is a local testing daemon for Fastly Compute."
-version = "0.16.6"
+version = "0.20.2"
 authors = ["Fastly"]
 readme = "../README.md"
 edition = "2024"
@@ -24,7 +24,28 @@ include = [
     "../doc/logo.png",
     "src/**/*"
 ]
-rust-version = "1.90"
+
+# Install prebuilt binaries from GitHub releases instead of compiling.
+# Release assets are named e.g. `viceroy_v0.18.1_linux-amd64.tar.gz` and contain
+# a single `viceroy` binary at the archive root.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/viceroy_v{ version }_darwin-amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/viceroy_v{ version }_darwin-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/viceroy_v{ version }_linux-amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/viceroy_v{ version }_linux-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/viceroy_v{ version }_windows-amd64.tar.gz"
 
 [[bin]]
 name = "viceroy"
@@ -43,7 +64,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "^0.3.16", features = ["env-filter", "fmt"] }
-viceroy-lib = { path = "..", version = "=0.16.6" }
+viceroy-lib = { path = "..", version = "=0.20.2" }
 wat = "^1.0.38"
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
@@ -54,3 +75,5 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }
 tls-listener = { version = "^0.7.0", features = ["rustls", "hyper-h1", "tokio-net", "rt"] }
+tempfile = "3"
+serde_json = { workspace = true }

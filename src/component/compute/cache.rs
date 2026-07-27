@@ -4,9 +4,9 @@ use {
         body::Body,
         cache::{self, CacheKey, SurrogateKeySet, VaryRule, WriteOptions},
         error::Error,
-        linking::{ComponentCtx, SessionView},
-        session::{PeekableTask, PendingCacheTask, Session},
-        wiggle_abi::types::{CacheBusyHandle, CacheHandle},
+        linking::{ComponentCtx, SandboxView},
+        sandbox::{PeekableTask, PendingCacheTask, Sandbox},
+        wiggle_abi::types::{AsyncItemHandle, CacheBusyHandle, CacheHandle},
     },
     bytes::Bytes,
     http::HeaderMap,
@@ -96,12 +96,12 @@ struct LookupOptions {
 }
 
 fn load_lookup_options(
-    session: &Session,
+    sandbox: &Sandbox,
     options: api::LookupOptions,
 ) -> Result<LookupOptions, Error> {
     let headers = if let Some(request_headers) = options.request_headers {
         let handle = request_headers;
-        let parts = session.request_parts(handle.into())?;
+        let parts = sandbox.request_parts(handle.into())?;
         parts.headers.clone()
     } else {
         HeaderMap::default()
@@ -122,18 +122,18 @@ impl api::Host for ComponentCtx {
         mut options: api::WriteOptions,
     ) -> Result<Resource<api::Body>, types::Error> {
         let key: CacheKey = get_key(key)?;
-        let cache = Arc::clone(self.session().cache());
+        let cache = Arc::clone(self.sandbox().cache());
 
         let request_headers = if let Some(handle) = options.request_headers.take() {
-            let parts = self.session().request_parts(handle.into())?;
+            let parts = self.sandbox().request_parts(handle.into())?;
             parts.headers.clone()
         } else {
             HeaderMap::default()
         };
         let options = load_write_options(&options)?;
 
-        let handle = self.session_mut().insert_body(Body::empty());
-        let read_body = self.session_mut().begin_streaming(handle)?;
+        let handle = self.sandbox_mut().insert_body(Body::empty());
+        let read_body = self.sandbox_mut().begin_streaming(handle)?;
         cache
             .insert(&key, request_headers, options, read_body)
             .await;
@@ -157,12 +157,12 @@ impl api::Host for ComponentCtx {
     ) -> Result<Resource<api::Entry>, types::Error> {
         let handle = CacheBusyHandle::from(handle).into();
         // Swap out for a distinct handle, so we don't hit a repeated `close`+`close_busy`:
-        let entry = self.session_mut().cache_entry_mut(handle).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle).await?;
         let mut other_entry = entry.stub();
         std::mem::swap(entry, &mut other_entry);
         let task = PeekableTask::spawn(Box::pin(async move { Ok(other_entry) })).await;
         let h: CacheHandle = self
-            .session_mut()
+            .sandbox_mut()
             .insert_cache_op(PendingCacheTask::new(task))
             .into();
         Ok(h.into())
@@ -174,13 +174,13 @@ impl api::Host for ComponentCtx {
     ) -> Result<(), types::Error> {
         let handle = CacheBusyHandle::from(handle).into();
         // Don't wait for the transaction to complete; drop the future to cancel.
-        let _ = self.session_mut().take_cache_entry(handle)?;
+        let _ = self.sandbox_mut().take_cache_entry(handle)?;
         Ok(())
     }
 
     async fn close_entry(&mut self, handle: Resource<api::Entry>) -> Result<(), types::Error> {
         let _ = self
-            .session_mut()
+            .sandbox_mut()
             .take_cache_entry(handle.into())?
             .task()
             .recv()
@@ -297,6 +297,16 @@ impl api::HostReplaceEntry for ComponentCtx {
     fn drop(&mut self, _entry: Resource<api::ReplaceEntry>) -> wasmtime::Result<()> {
         Ok(())
     }
+
+    fn step(
+        &mut self,
+        _handle: Resource<api::ReplaceEntry>,
+    ) -> wasmtime::Result<Option<Resource<api::Pollable>>> {
+        Err(Error::Unsupported {
+            msg: "Cache API primitives not yet supported",
+        }
+        .into())
+    }
 }
 
 impl api::HostEntry for ComponentCtx {
@@ -308,10 +318,10 @@ impl api::HostEntry for ComponentCtx {
         let LookupOptions {
             headers,
             always_use_requested_range,
-        } = load_lookup_options(self.session(), options)?;
+        } = load_lookup_options(self.sandbox(), options)?;
 
         let key: CacheKey = get_key(key)?;
-        let cache = Arc::clone(self.session().cache());
+        let cache = Arc::clone(self.sandbox().cache());
 
         let task = PeekableTask::spawn(Box::pin(async move {
             Ok(cache
@@ -321,7 +331,7 @@ impl api::HostEntry for ComponentCtx {
         }))
         .await;
         let task = PendingCacheTask::new(task);
-        let handle: CacheHandle = self.session_mut().insert_cache_op(task).into();
+        let handle: CacheHandle = self.sandbox_mut().insert_cache_op(task).into();
         Ok(handle.into())
     }
 
@@ -335,20 +345,20 @@ impl api::HostEntry for ComponentCtx {
         let from = options.from;
         let to = options.to;
 
-        // We wind up re-borrowing `found` and `self.session` several times here, to avoid
+        // We wind up re-borrowing `found` and `self.sandbox` several times here, to avoid
         // borrowing the both of them at once.
         // (It possible that inserting a body would change the address of Found, by re-shuffling
         // the AsyncItems table; we have to live by borrowck's rules.)
         //
-        // We have an exclusive borrow self.session_mut() for the lifetime of this call,
+        // We have an exclusive borrow self.sandbox_mut() for the lifetime of this call,
         // so even though we're re-borrowing/repeating lookups, we know we won't run into TOCTOU.
 
-        let entry = self.session_mut().cache_entry(handle).await?;
+        let entry = self.sandbox_mut().cache_entry(handle).await?;
 
         // Preemptively (optimistically) start a read. Don't worry, the Drop impl for Body will
         // clean up the copying task.
-        // We have to do this to allow `found`'s lifetime to end before self.session().body, which
-        // has to re-borrow self.self.session().
+        // We have to do this to allow `found`'s lifetime to end before self.sandbox().body, which
+        // has to re-borrow self.self.sandbox().
         let body = entry.body(from, to).await?;
         let found = entry
             .found()
@@ -356,16 +366,16 @@ impl api::HostEntry for ComponentCtx {
 
         if let Some(prev_handle) = found.last_body_handle {
             // Check if they're still reading the previous handle.
-            if self.session().body(prev_handle).is_ok() {
+            if self.sandbox().body(prev_handle).is_ok() {
                 return Err(Error::CacheError(cache::Error::HandleBodyUsed).into());
             }
         };
 
-        let body_handle = self.session_mut().insert_body(body);
+        let body_handle = self.sandbox_mut().insert_body(body);
 
         // Finalize by committing the handle as "the last read".
         // We have to borrow `found` again, this time as mutable.
-        self.session_mut()
+        self.sandbox_mut()
             .cache_entry_mut(handle)
             .await?
             .found_mut()
@@ -392,10 +402,10 @@ impl api::HostEntry for ComponentCtx {
         let LookupOptions {
             headers,
             always_use_requested_range,
-        } = load_lookup_options(self.session(), options)?;
+        } = load_lookup_options(self.sandbox(), options)?;
 
         let key: CacheKey = get_key(key)?;
-        let cache = Arc::clone(self.session().cache());
+        let cache = Arc::clone(self.sandbox().cache());
 
         // Look up once, joining the transaction only if obligated:
         let e = cache
@@ -418,7 +428,7 @@ impl api::HostEntry for ComponentCtx {
         };
 
         let task = PendingCacheTask::new(task);
-        let handle: CacheBusyHandle = self.session_mut().insert_cache_op(task).into();
+        let handle: CacheBusyHandle = self.sandbox_mut().insert_cache_op(task).into();
         Ok(handle.into())
     }
 
@@ -431,7 +441,7 @@ impl api::HostEntry for ComponentCtx {
             .transaction_insert_and_stream_back(handle, options)
             .await?;
         // Ignore the "stream back" handle
-        let _ = self.session_mut().take_cache_entry(cache_handle.into())?;
+        let _ = self.sandbox_mut().take_cache_entry(cache_handle.into())?;
         Ok(body)
     }
 
@@ -446,18 +456,18 @@ impl api::HostEntry for ComponentCtx {
         }
         let options = load_write_options(&options)?;
 
-        // Optimistically start a body, so we don't have to reborrow self.session_mut()
-        let body_handle = self.session_mut().insert_body(Body::empty());
-        let read_body = self.session_mut().begin_streaming(body_handle)?;
+        // Optimistically start a body, so we don't have to reborrow self.sandbox_mut()
+        let body_handle = self.sandbox_mut().insert_body(Body::empty());
+        let read_body = self.sandbox_mut().begin_streaming(body_handle)?;
 
         let e = self
-            .session_mut()
+            .sandbox_mut()
             .cache_entry_mut(handle.into())
             .await?
             .insert(options, read_body)?;
         // Return a new handle for the read end.
         let handle: CacheHandle = self
-            .session_mut()
+            .sandbox_mut()
             .insert_cache_op(PendingCacheTask::new(PeekableTask::complete(e)))
             .into();
 
@@ -475,7 +485,7 @@ impl api::HostEntry for ComponentCtx {
         }
         let options = load_write_options(&options)?;
 
-        let entry = self.session_mut().cache_entry_mut(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle.into()).await?;
         // The path here is:
         // InvalidCacheHandle -> FastlyStatus::BADF -> (ABI boundary) ->
         // CacheError::InvalidOperation
@@ -487,7 +497,7 @@ impl api::HostEntry for ComponentCtx {
         &mut self,
         handle: Resource<api::Entry>,
     ) -> Result<(), types::Error> {
-        let entry = self.session_mut().cache_entry_mut(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle.into()).await?;
         if entry.cancel() {
             Ok(())
         } else {
@@ -499,7 +509,7 @@ impl api::HostEntry for ComponentCtx {
         &mut self,
         handle: Resource<api::Entry>,
     ) -> Result<api::LookupState, types::Error> {
-        let entry = self.session_mut().cache_entry_mut(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle.into()).await?;
 
         let mut state = api::LookupState::empty();
         if let Some(found) = entry.found() {
@@ -527,7 +537,7 @@ impl api::HostEntry for ComponentCtx {
         handle: Resource<api::Entry>,
         max_len: u64,
     ) -> Result<Option<Vec<u8>>, types::Error> {
-        let entry = self.session_mut().cache_entry(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry(handle.into()).await?;
 
         let md_bytes = entry
             .found()
@@ -544,7 +554,7 @@ impl api::HostEntry for ComponentCtx {
         &mut self,
         handle: Resource<api::Entry>,
     ) -> Result<Option<u64>, types::Error> {
-        let Some(found) = self.session_mut().cache_entry(handle.into()).await?.found() else {
+        let Some(found) = self.sandbox_mut().cache_entry(handle.into()).await?.found() else {
             return Ok(None);
         };
         Ok(found.length())
@@ -554,7 +564,7 @@ impl api::HostEntry for ComponentCtx {
         &mut self,
         handle: Resource<api::Entry>,
     ) -> Result<Option<u64>, types::Error> {
-        let entry = self.session_mut().cache_entry_mut(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle.into()).await?;
         if let Some(found) = entry.found() {
             Ok(Some(found.meta().max_age().as_nanos().try_into().unwrap()))
         } else {
@@ -576,7 +586,7 @@ impl api::HostEntry for ComponentCtx {
         &mut self,
         handle: Resource<api::Entry>,
     ) -> Result<Option<u64>, types::Error> {
-        let entry = self.session_mut().cache_entry_mut(handle.into()).await?;
+        let entry = self.sandbox_mut().cache_entry_mut(handle.into()).await?;
         if let Some(found) = entry.found() {
             Ok(Some(found.meta().age().as_nanos().try_into().unwrap()))
         } else {
@@ -596,6 +606,21 @@ impl api::HostEntry for ComponentCtx {
 
     fn drop(&mut self, _entry: Resource<api::Entry>) -> wasmtime::Result<()> {
         Ok(())
+    }
+
+    fn step(
+        &mut self,
+        entry: Resource<api::Entry>,
+    ) -> wasmtime::Result<Option<Resource<api::Pollable>>> {
+        let cache_handle = CacheHandle::from(entry);
+        let async_handle = cache_handle.into();
+        let is_ready = self.sandbox_mut().async_item_mut(async_handle)?.is_ready();
+
+        if is_ready {
+            Ok(None)
+        } else {
+            Ok(Some(AsyncItemHandle::from(async_handle).into()))
+        }
     }
 }
 

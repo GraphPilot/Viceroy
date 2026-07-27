@@ -6,23 +6,24 @@ use super::types::SendErrorDetail;
 use crate::cache::CacheOverride;
 use crate::config::ClientCertInfo;
 use crate::secret_store::SecretLookup;
+use std::time::Duration;
 
 use {
     crate::{
         config::Backend,
         error::Error,
-        pushpin::{PushpinRedirectInfo, PushpinRedirectRequestInfo},
-        session::{AsyncItem, PeekableTask, Session, ViceroyRequestMetadata},
+        handoff::{HandoffInfo, HandoffRequestInfo},
+        sandbox::{AsyncItem, PeekableTask, Sandbox, ViceroyRequestMetadata},
         upstream,
         wiggle_abi::{
             fastly_http_downstream::FastlyHttpDownstream,
             fastly_http_req::FastlyHttpReq,
-            headers::HttpHeaders,
+            headers::{HttpHeadersRead, HttpHeadersWrite},
             types::{
                 BackendConfigOptions, BodyHandle, CacheOverrideTag, ClientCertVerifyResult,
                 ContentEncodings, DynamicBackendConfig, FramingHeadersMode, HttpVersion,
                 InspectInfo, InspectInfoMask, MultiValueCursor, MultiValueCursorResult,
-                PendingRequestHandle, RequestHandle, ResponseHandle,
+                PendingRequestHandle, PendingResponseKind, RequestHandle, ResponseHandle,
             },
         },
     },
@@ -32,7 +33,7 @@ use {
     wiggle::{GuestMemory, GuestPtr},
 };
 
-impl FastlyHttpReq for Session {
+impl FastlyHttpReq for Sandbox {
     fn body_downstream_get(
         &mut self,
         _memory: &mut GuestMemory<'_>,
@@ -71,7 +72,7 @@ impl FastlyHttpReq for Session {
     ) -> Result<(), Error> {
         let sk = if sk.len() > 0 {
             let sk = memory.as_slice(sk)?.ok_or(Error::SharedMemory)?;
-            let sk = HeaderValue::from_bytes(&sk).map_err(|_| Error::InvalidArgument)?;
+            let sk = HeaderValue::from_bytes(sk).map_err(|_| Error::InvalidArgument)?;
             Some(sk)
         } else {
             None
@@ -204,16 +205,7 @@ impl FastlyHttpReq for Session {
     }
 
     #[allow(unused_variables)] // FIXME ACF 2022-10-03: Remove this directive once implemented.
-    fn redirect_to_websocket_proxy(
-        &mut self,
-        memory: &mut GuestMemory<'_>,
-        backend_name: GuestPtr<str>,
-    ) -> Result<(), Error> {
-        Err(Error::NotAvailable("Redirect to WebSocket proxy"))
-    }
-
-    #[allow(unused_variables)] // FIXME ACF 2022-10-03: Remove this directive once implemented.
-    fn redirect_to_grip_proxy(
+    async fn redirect_to_websocket_proxy(
         &mut self,
         memory: &mut GuestMemory<'_>,
         backend_name: GuestPtr<str>,
@@ -222,25 +214,35 @@ impl FastlyHttpReq for Session {
             .as_str(backend_name)?
             .ok_or(Error::SharedMemory)?
             .to_string();
-        let redirect_info = PushpinRedirectInfo {
+        let redirect_info = HandoffInfo {
             backend_name,
             request_info: None,
         };
 
-        self.redirect_downstream_to_pushpin(redirect_info)?;
+        self.redirect_downstream_to_backend(redirect_info).await?;
         Ok(())
     }
 
-    fn redirect_to_websocket_proxy_v2(
+    #[allow(unused_variables)] // FIXME ACF 2022-10-03: Remove this directive once implemented.
+    async fn redirect_to_grip_proxy(
         &mut self,
-        _memory: &mut GuestMemory<'_>,
-        _req_handle: RequestHandle,
-        _backend: GuestPtr<str>,
+        memory: &mut GuestMemory<'_>,
+        backend_name: GuestPtr<str>,
     ) -> Result<(), Error> {
-        Err(Error::NotAvailable("Redirect to WebSocket proxy"))
+        let backend_name = memory
+            .as_str(backend_name)?
+            .ok_or(Error::SharedMemory)?
+            .to_string();
+        let redirect_info = HandoffInfo {
+            backend_name,
+            request_info: None,
+        };
+
+        self.redirect_downstream_to_pushpin(redirect_info).await?;
+        Ok(())
     }
 
-    fn redirect_to_grip_proxy_v2(
+    async fn redirect_to_websocket_proxy_v2(
         &mut self,
         memory: &mut GuestMemory<'_>,
         req_handle: RequestHandle,
@@ -251,12 +253,32 @@ impl FastlyHttpReq for Session {
             .ok_or(Error::SharedMemory)?
             .to_string();
         let req = self.request_parts(req_handle)?;
-        let redirect_info = PushpinRedirectInfo {
+        let redirect_info = HandoffInfo {
             backend_name,
-            request_info: Some(PushpinRedirectRequestInfo::from_parts(req)),
+            request_info: Some(HandoffRequestInfo::from_parts(req)),
         };
 
-        self.redirect_downstream_to_pushpin(redirect_info)?;
+        self.redirect_downstream_to_backend(redirect_info).await?;
+        Ok(())
+    }
+
+    async fn redirect_to_grip_proxy_v2(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        req_handle: RequestHandle,
+        backend_name: GuestPtr<str>,
+    ) -> Result<(), Error> {
+        let backend_name = memory
+            .as_str(backend_name)?
+            .ok_or(Error::SharedMemory)?
+            .to_string();
+        let req = self.request_parts(req_handle)?;
+        let redirect_info = HandoffInfo {
+            backend_name,
+            request_info: Some(HandoffRequestInfo::from_parts(req)),
+        };
+
+        self.redirect_downstream_to_pushpin(redirect_info).await?;
         Ok(())
     }
 
@@ -461,7 +483,7 @@ impl FastlyHttpReq for Session {
                 let byte_slice = memory
                     .as_slice(config.ca_cert.as_array(config.ca_cert_len))?
                     .ok_or(Error::SharedMemory)?;
-                let mut byte_cursor = std::io::Cursor::new(&byte_slice[..]);
+                let mut byte_cursor = std::io::Cursor::new(byte_slice);
                 rustls_pemfile::certs(&mut byte_cursor)?
                     .drain(..)
                     .map(rustls::Certificate)
@@ -483,7 +505,7 @@ impl FastlyHttpReq for Session {
                 .as_slice(config.cert_hostname.as_array(config.cert_hostname_len))?
                 .ok_or(Error::SharedMemory)?;
 
-            Some(std::str::from_utf8(&byte_slice)?.to_owned())
+            Some(std::str::from_utf8(byte_slice)?.to_owned())
         } else {
             None
         };
@@ -497,7 +519,7 @@ impl FastlyHttpReq for Session {
                 let byte_slice = memory
                     .as_slice(config.sni_hostname.as_array(config.sni_hostname_len))?
                     .ok_or(Error::SharedMemory)?;
-                let sni_hostname = std::str::from_utf8(&byte_slice)?;
+                let sni_hostname = std::str::from_utf8(byte_slice)?;
                 if let Some(cert_host) = &cert_host {
                     if cert_host != sni_hostname {
                         // because we're using rustls, we cannot support distinct SNI and cert hostnames
@@ -545,12 +567,28 @@ impl FastlyHttpReq for Session {
                 SecretLookup::Injected { plaintext } => plaintext,
             };
 
-            Some(ClientCertInfo::new(&cert_slice, key)?)
+            Some(ClientCertInfo::new(cert_slice, key)?)
         } else {
             None
         };
 
         let grpc = backend_info_mask.contains(BackendConfigOptions::GRPC);
+
+        let first_byte_timeout =
+            if backend_info_mask.contains(BackendConfigOptions::FIRST_BYTE_TIMEOUT) {
+                Some(Duration::from_millis(config.first_byte_timeout_ms as u64))
+            } else {
+                None
+            };
+
+        let between_bytes_timeout =
+            if backend_info_mask.contains(BackendConfigOptions::BETWEEN_BYTES_TIMEOUT) {
+                Some(Duration::from_millis(
+                    config.between_bytes_timeout_ms as u64,
+                ))
+            } else {
+                None
+            };
 
         let new_backend = Backend {
             uri: Uri::builder()
@@ -562,8 +600,11 @@ impl FastlyHttpReq for Session {
             cert_host,
             use_sni,
             grpc,
+            first_byte_timeout,
+            between_bytes_timeout,
             client_cert,
             ca_certs,
+            health: crate::config::BackendHealth::Unknown,
         };
 
         if !self.add_backend(&name, new_backend) {
@@ -676,7 +717,7 @@ impl FastlyHttpReq for Session {
         value: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.request_parts_mut(req_handle)?.headers;
-        HttpHeaders::insert(headers, memory, name, value)
+        HttpHeadersWrite::insert(headers, memory, name, value)
     }
 
     fn header_append(
@@ -687,7 +728,7 @@ impl FastlyHttpReq for Session {
         value: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.request_parts_mut(req_handle)?.headers;
-        HttpHeaders::append(headers, memory, name, value)
+        HttpHeadersWrite::append(headers, memory, name, value)
     }
 
     fn header_remove(
@@ -697,7 +738,7 @@ impl FastlyHttpReq for Session {
         name: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.request_parts_mut(req_handle)?.headers;
-        HttpHeaders::remove(headers, memory, name)
+        HttpHeadersWrite::remove(headers, memory, name)
     }
 
     fn method_get(
@@ -807,7 +848,7 @@ impl FastlyHttpReq for Session {
     ) -> Result<(), Error> {
         let req = self.request_parts_mut(req_handle)?;
 
-        let version = hyper::Version::try_from(version)?;
+        let version = hyper::Version::from(version);
         req.version = version;
         Ok(())
     }
@@ -822,7 +863,7 @@ impl FastlyHttpReq for Session {
         let backend_bytes_slice = memory
             .as_slice(backend_bytes.as_bytes())?
             .ok_or(Error::SharedMemory)?;
-        let backend_name = std::str::from_utf8(&backend_bytes_slice)?;
+        let backend_name = std::str::from_utf8(backend_bytes_slice)?;
 
         // prepare the request
         let req_parts = self.take_request_parts(req_handle)?;
@@ -833,7 +874,7 @@ impl FastlyHttpReq for Session {
             .ok_or_else(|| Error::UnknownBackend(backend_name.to_owned()))?;
 
         // synchronously send the request
-        let resp = upstream::send_request(req, backend, self.tls_config()).await?;
+        let resp = upstream::send_request(req, backend, backend_name, self.tls_config()).await?;
         Ok(self.insert_response(resp))
     }
 
@@ -872,7 +913,7 @@ impl FastlyHttpReq for Session {
         let backend_bytes_slice = memory
             .as_slice(backend_bytes.as_bytes())?
             .ok_or(Error::SharedMemory)?;
-        let backend_name = std::str::from_utf8(&backend_bytes_slice)?;
+        let backend_name = std::str::from_utf8(backend_bytes_slice)?;
 
         // prepare the request
         let req_parts = self.take_request_parts(req_handle)?;
@@ -883,8 +924,13 @@ impl FastlyHttpReq for Session {
             .ok_or_else(|| Error::UnknownBackend(backend_name.to_owned()))?;
 
         // asynchronously send the request
-        let task =
-            PeekableTask::spawn(upstream::send_request(req, backend, self.tls_config())).await;
+        let task = PeekableTask::spawn(upstream::send_request(
+            req,
+            backend,
+            backend_name,
+            self.tls_config(),
+        ))
+        .await;
 
         // return a handle to the pending task
         Ok(self.insert_pending_request(task))
@@ -928,11 +974,87 @@ impl FastlyHttpReq for Session {
             .ok_or_else(|| Error::UnknownBackend(backend_name.to_owned()))?;
 
         // asynchronously send the request
-        let task =
-            PeekableTask::spawn(upstream::send_request(req, backend, self.tls_config())).await;
+        let task = PeekableTask::spawn(upstream::send_request(
+            req,
+            backend,
+            backend_name,
+            self.tls_config(),
+        ))
+        .await;
 
         // return a handle to the pending task
         Ok(self.insert_pending_request(task))
+    }
+
+    fn pending_req_header_insert(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        h: PendingRequestHandle,
+        name: GuestPtr<[u8]>,
+        value: GuestPtr<[u8]>,
+        target: PendingResponseKind,
+    ) -> Result<(), Error> {
+        let pending = self.pending_request_mut(h)?;
+
+        match target {
+            PendingResponseKind::Any => {
+                HttpHeadersWrite::insert(pending.headers_resp_mut(), memory, name, value)?;
+                HttpHeadersWrite::insert(pending.headers_err_mut(), memory, name, value)
+            }
+            PendingResponseKind::Response => {
+                HttpHeadersWrite::insert(pending.headers_resp_mut(), memory, name, value)
+            }
+            PendingResponseKind::Error => {
+                HttpHeadersWrite::insert(pending.headers_err_mut(), memory, name, value)
+            }
+        }
+    }
+
+    fn pending_req_header_append(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        h: PendingRequestHandle,
+        name: GuestPtr<[u8]>,
+        value: GuestPtr<[u8]>,
+        target: PendingResponseKind,
+    ) -> Result<(), Error> {
+        let pending = self.pending_request_mut(h)?;
+
+        match target {
+            PendingResponseKind::Any => {
+                HttpHeadersWrite::append(pending.headers_resp_mut(), memory, name, value)?;
+                HttpHeadersWrite::append(pending.headers_err_mut(), memory, name, value)
+            }
+            PendingResponseKind::Response => {
+                HttpHeadersWrite::append(pending.headers_resp_mut(), memory, name, value)
+            }
+            PendingResponseKind::Error => {
+                HttpHeadersWrite::append(pending.headers_err_mut(), memory, name, value)
+            }
+        }
+    }
+
+    fn pending_req_header_remove(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        h: PendingRequestHandle,
+        name: GuestPtr<[u8]>,
+        target: PendingResponseKind,
+    ) -> Result<(), Error> {
+        let pending = self.pending_request_mut(h)?;
+
+        match target {
+            PendingResponseKind::Any => {
+                HttpHeadersWrite::remove(pending.headers_resp_mut(), memory, name)?;
+                HttpHeadersWrite::remove(pending.headers_err_mut(), memory, name)
+            }
+            PendingResponseKind::Response => {
+                HttpHeadersWrite::remove(pending.headers_resp_mut(), memory, name)
+            }
+            PendingResponseKind::Error => {
+                HttpHeadersWrite::remove(pending.headers_err_mut(), memory, name)
+            }
+        }
     }
 
     // note: The first value in the return tuple represents whether the request is done: 0 when not
@@ -1018,19 +1140,16 @@ impl FastlyHttpReq for Session {
         )?;
 
         let outcome = match item {
-            AsyncItem::PendingReq(task) => match task {
-                PeekableTask::Complete(res) => match res {
-                    Ok(res) => {
-                        let (resp_handle, body_handle) = self.insert_response(res);
-                        (done_index, resp_handle, body_handle)
-                    }
-                    Err(_) => (
-                        done_index,
-                        INVALID_RESPONSE_HANDLE.into(),
-                        INVALID_BODY_HANDLE.into(),
-                    ),
-                },
-                _ => panic!("Pending request was not completed"),
+            AsyncItem::PendingReq(task) => match task.recv().await {
+                Ok(res) => {
+                    let (resp_handle, body_handle) = self.insert_response(res);
+                    (done_index, resp_handle, body_handle)
+                }
+                Err(_) => (
+                    done_index,
+                    INVALID_RESPONSE_HANDLE.into(),
+                    INVALID_BODY_HANDLE.into(),
+                ),
             },
             _ => panic!("AsyncItem was not a pending request"),
         };
@@ -1070,7 +1189,7 @@ impl FastlyHttpReq for Session {
         encodings: ContentEncodings,
     ) -> Result<(), Error> {
         // NOTE: We're going to hide this flag in the extensions of the request in order to decrease
-        // the book-keeping burden inside Session. The flag will get picked up later, in `send_request`.
+        // the book-keeping burden inside Sandbox. The flag will get picked up later, in `send_request`.
         let extensions = &mut self.request_parts_mut(req_handle)?.extensions;
 
         match extensions.get_mut::<ViceroyRequestMetadata>() {
@@ -1116,7 +1235,7 @@ impl FastlyHttpReq for Session {
                 Ok(s)
             } else {
                 // For now, corp and workspace arguments are required to actually generate the hostname,
-                // but in the future the lookaside service will be generated using the customer ID, and
+                // but in the future, the lookaside service will be generated using the customer ID, and
                 // it will be okay for them to be unspecified or empty.
                 Err(Error::InvalidArgument)
             }
@@ -1181,7 +1300,7 @@ fn read_guest_ip(
     bytes: &GuestPtr<u8>,
     len: u32,
 ) -> Result<Option<IpAddr>, Error> {
-    let bytes = memory.as_slice(bytes.as_array(len as u32))?;
+    let bytes = memory.as_slice(bytes.as_array(len))?;
 
     match len {
         0 => Ok(None),

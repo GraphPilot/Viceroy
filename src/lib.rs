@@ -19,7 +19,7 @@ pub mod cache;
 pub mod config;
 pub mod error;
 pub mod logging;
-pub mod session;
+pub mod sandbox;
 
 mod acl;
 mod async_io;
@@ -28,11 +28,10 @@ mod collecting_body;
 pub mod component;
 mod downstream;
 mod execute;
-mod framing;
-mod headers;
+mod handoff;
+mod http;
 mod linking;
 mod object_store;
-mod pushpin;
 mod secret_store;
 mod service;
 mod shielding_site;
@@ -42,6 +41,6 @@ mod upstream;
 pub mod wiggle_abi;
 
 pub use {
-    error::Error, execute::ExecuteCtx, execute::GuestProfileConfig, service::ViceroyService,
-    upstream::BackendConnector, wasmtime::ProfilingStrategy,
+    error::Error, execute::ExecuteCtx, execute::GuestProfileConfig, execute::WasmFeatures,
+    service::ViceroyService, upstream::BackendConnector, wasmtime::ProfilingStrategy,
 };

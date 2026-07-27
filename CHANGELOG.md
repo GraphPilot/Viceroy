@@ -1,5 +1,45 @@
 ## Unreleased
 
+## 0.20.1 (2026-07-16)
+
+- Fix wiggle abi implementation for bot detection mocking. ([#664](https://github.com/fastly/Viceroy/pull/664))
+
+## 0.20.0 (2026-07-09)
+
+- Always use an `unsafe` block to `unsafe_main_ptr`. ([#643](https://github.com/fastly/Viceroy/pull/643))
+- Add support for healthchecking dynamic backends ([#635](https://github.com/fastly/Viceroy/pull/635))
+- Add support for headers-based bot detection mocking, as well as headless bots in the API, updated to v0.13.0 of Fastly crate ([#658](https://github.com/fastly/Viceroy/pull/658))
+
+## 0.19.0 (2026-06-16)
+
+- Fix adapter codegen to avoid memory shift overflow, and support SIMD instructions. ([#629](https://github.com/fastly/Viceroy/pull/629))
+- Add support for sending `PendingRequestHandle` downstream ([#631](https://github.com/fastly/Viceroy/pull/631))
+- Update to the latest WITs and adapter. ([#637](https://github.com/fastly/Viceroy/pull/637))
+- Fix to correctly apply TLS when using `wss:` URL schema with WebSockets passthrough ([#636](https://github.com/fastly/Viceroy/pull/636))
+- Add support for `first_byte_timeout` and `between_bytes_timeout` on backends ([#622](https://github.com/fastly/Viceroy/pull/622))
+- Add cargo-binstall metadata so `cargo binstall viceroy` can fetch a prebuilt binary ([#625](https://github.com/fastly/Viceroy/pull/625))
+- Snapshot cache `Found` length at lookup time so `poll_known_length` matches production Compute behavior ([#630](https://github.com/fastly/Viceroy/pull/630))
+- Add `release-lto-stripped` cargo profile, reducing the size of release binaries ([#632](https://github.com/fastly/Viceroy/pull/632))
+
+## 0.18.0 (2026-05-21)
+
+- Fix noshift adapter selection for wit-bindgen library components. ([#618](https://github.com/fastly/Viceroy/pull/618))
+- Rename 'session' to 'sandbox' since that is the preferred term in public documentation. ([#617](https://github.com/fastly/Viceroy/pull/617))
+- Add support for "WebSockets passthrough" ([#621](https://github.com/fastly/Viceroy/pull/621))
+- Provide extra context in error messages for backend connection failures ([#613](https://github.com/fastly/Viceroy/pull/613))
+- Update to wit-component 0.250.0, picking up a bug fix. ([#623](https://github.com/fastly/Viceroy/pull/623))
+
+## 0.17.0 (2026-04-27)
+
+- Add stub implementations for resvpnproxy hostcalls. ([#596](https://github.com/fastly/Viceroy/pull/596))
+- Add `fake_valid_fastly_keys` config parameter to allow testing `fastly_key_is_valid` hostcall with fake valid keys. ([#599](https://github.com/fastly/Viceroy/pull/599))
+- Add `health` config parameter for backends to mock backend health status in testing. ([#605](https://github.com/fastly/Viceroy/pulls/606))
+- Use `cargo clippy` to lint code in CI. ([#603](https://github.com/fastly/Viceroy/pull/603))
+- Rename `Error::InvalidAlpnRepsonse` to correct a typo ([#612](https://github.com/fastly/Viceroy/pull/612))
+- Upgrade to Rust 1.95 ([#604](https://github.com/fastly/Viceroy/pull/604))
+- Add options for experimenting with wasm gc and exceptions. ([#601](https://github.com/fastly/Viceroy/pull/601))
+- Improve TLS certificate loading, handling and validation ([#478](https://github.com/fastly/Viceroy/pull/478))
+
 ## 0.16.5 (2026-03-23)
 
 - Remove most adapter-only interfaces from the Viceroy component adapter. ([#583](https://github.com/fastly/Viceroy/pull/583))
@@ -12,6 +52,8 @@
 - Update to Rust 2024 Edition. ([#588](https://github.com/fastly/Viceroy/pull/588))
 - Add stub implementations for bot detection hostcalls. ([#592](https://github.com/fastly/Viceroy/pull/592))
 - Add no-op implementations for stale-if-error hostcalls ([#591](https://github.com/fastly/Viceroy/pull/591))
+- Guest profiling support added for components. ([#593](https://github.com/fastly/Viceroy/pull/593))
+- Add `manifest_version` validation to fastly.toml parsing. ([#590](https://github.com/fastly/Viceroy/pull/590))
 
 ## 0.16.4 (2026-01-26)
 
@@ -86,7 +128,7 @@
 
 ## 0.14.0 (2025-08-08)
 
-- Fix for shielding suport ([#503](https://github.com/fastly/Viceroy/pull/503))
+- Fix for shielding support ([#503](https://github.com/fastly/Viceroy/pull/503))
 
   Shielding support in 0.13.0 was, alas, slightly broken: the `toml` settings were
   not passed through to the main library.
@@ -100,12 +142,12 @@
   messaging) features like HTTP streaming or WebSockets-over-HTTP.
 
   Requests forwarded this way will be replayed:
-   - Method, headers, path, and query of the forwarded request will be based on
-     the request whose handle is passed to `redirect_to_grip_proxy_v2` (or from
-     the downstream request if `redirect_to_grip_proxy` was called).
-   - The request header `pushpin-route` will be added, its value set to the backend name.
-   - Request body of the forwarded request will contain the full body of the
-     downstream request.
+  - Method, headers, path, and query of the forwarded request will be based on
+    the request whose handle is passed to `redirect_to_grip_proxy_v2` (or from
+    the downstream request if `redirect_to_grip_proxy` was called).
+  - The request header `pushpin-route` will be added, its value set to the backend name.
+  - Request body of the forwarded request will contain the full body of the
+    downstream request.
 
   This mechanism expects Pushpin to be configured with `accept_pushpin_route`
   to be set to `true` and for its routes to be set up properly. This is
@@ -217,8 +259,8 @@
 
 - Add support for supplying client certificates in fastly.toml, through the use of the
   `client_cert_info` table, which must have one of a "certificate" or "certificate_file"
-  key, as well as one of a "key" and "key_file" key. The "_file" variants can be used to
-  point to certificate/key files on disk, whereas the non-"_file" variants should be
+  key, as well as one of a "key" and "key_file" key. The "\_file" variants can be used to
+  point to certificate/key files on disk, whereas the non-"\_file" variants should be
   multi-line string constants in the toml. In all cases, they should be in PEM format.
 - Restore compatibility with older glibc versions in release artifacts
 
@@ -244,7 +286,7 @@
 - Explicitly test the dictionary host calls in the dictionary fixture ([#390](https://github.com/fastly/Viceroy/pull/390))
 - Enable the config-store-lookup tests ([#387](https://github.com/fastly/Viceroy/pull/387))
 - Run the `request` tests as a component ([#386](https://github.com/fastly/Viceroy/pull/386))
-- Update Ubuntu and MacOS runners to latest (and non-EOL) versions ([#388](https://github.com/fastly/Viceroy/pull/388))
+- Update Ubuntu and macOS runners to latest (and non-EOL) versions ([#388](https://github.com/fastly/Viceroy/pull/388))
 - Fix trap handling when running components ([#382](https://github.com/fastly/Viceroy/pull/382))
 - fix(wiggle_abi): write the result's length, not the guest buffer's ([#385](https://github.com/fastly/Viceroy/pull/385))
 - Add adaptive buffer support for geo + device detection lookups ([#383](https://github.com/fastly/Viceroy/pull/383))
@@ -339,7 +381,7 @@
 - Fill downstream_client_request_id in ([#282](https://github.com/fastly/Viceroy/pull/282))
 - Bump to wasmtime-10.0.0 ([#279](https://github.com/fastly/Viceroy/pull/279))
 - Add a stub for downstream_client_request_id ([#276](https://github.com/fastly/Viceroy/pull/276))
--  Fix various warnings ([#271](https://github.com/fastly/Viceroy/pull/271))
+- Fix various warnings ([#271](https://github.com/fastly/Viceroy/pull/271))
 - ⛽ -> ⏲️ Switch from fuel to epoch interruptions. ([#273](https://github.com/fastly/Viceroy/pull/273))
 - Bump wasmtime dependencies to 9.0.1 ([#272](https://github.com/fastly/Viceroy/pull/272))
 - ⏩ none should not be defined in cache_override_tag witx ([#269](https://github.com/fastly/Viceroy/pull/269))
@@ -348,7 +390,7 @@
 
 ## 0.5.1 (2023-05-17)
 
--  Update crates and add http_keepalive_mode_set ([#266](https://github.com/fastly/Viceroy/pull/266))
+- Update crates and add http_keepalive_mode_set ([#266](https://github.com/fastly/Viceroy/pull/266))
 
 ## 0.5.0 (2023-05-11)
 
@@ -360,21 +402,27 @@
 - Add documentation explaining how to run rust unit tests w/ viceroy ([#242](https://github.com/fastly/Viceroy/pull/242))
 
 ## 0.4.5 (2023-04-13)
--  Remove validation on config store and dictionary names ([#248](https://github.com/fastly/Viceroy/pull/248))
+
+- Remove validation on config store and dictionary names ([#248](https://github.com/fastly/Viceroy/pull/248))
 
 ## 0.4.4 (2023-04-11)
+
 - feat: Allow local KV Stores to be defined using `[local_server.kv_stores]` ([#245](https://github.com/fastly/Viceroy/pull/245))
 
 ## 0.4.3 (2023-04-04)
+
 - Add the `fastly_backend` module to the wiggle abi ([#243](https://github.com/fastly/Viceroy/pull/243))
 
 ## 0.4.2 (2023-03-30)
+
 - Allow config-stores to be defined using `[local_server.config_stores]` ([#240](https://github.com/fastly/Viceroy/pull/240))
 
 ## 0.4.1 (2023-03-23)
+
 - Add `fastly_backend` interfaces for backend introspection ([#236](https://github.com/fastly/Viceroy/pull/236))
 
 ## 0.4.0 (2023-03-17)
+
 - Add a run-mode that executes the input program once and then exits ([#211](https://github.com/fastly/Viceroy/pull/211))
 - Update to Wasmtime 6.0.0 ([#226](https://github.com/fastly/Viceroy/pull/226))
 - Make object and secret store config names consistent ([#206](https://github.com/fastly/Viceroy/pull/206))
@@ -382,21 +430,25 @@
 - Split out run-mode and serve mode into subcommands ([#229](https://github.com/fastly/Viceroy/pull/229))
 
 ## 0.3.5 (2023-01-20)
+
 - Add support for Secret Store ([#210](https://github.com/fastly/Viceroy/pull/210))
 
 ## 0.3.4 (2023-01-19)
+
 - Update to Wasmtime 4.0.0
   ([#217](https://github.com/fastly/Viceroy/pull/217))
 - Set fixed release build images to improve compatibility of precompiled release artifacts
   ([#216](https://github.com/fastly/Viceroy/pull/216))
 
 ## 0.3.3 (2023-01-18)
+
 - Support the streaming body `finish()` method introduced in version 0.9.0 of the Rust SDK
   ([#203](https://github.com/fastly/Viceroy/pull/203))
 - Update to wasmtime 3.0.0 and enable experimental wasi-nn interface
   ([#209](https://github.com/fastly/Viceroy/pull/209))
 
 ## 0.3.2 (2022-11-17)
+
 - Add geolocation implementation to Viceroy
   ([#165](https://github.com/fastly/Viceroy/pull/165))
 - Implement async select hostcalls for Viceroy
@@ -420,6 +472,7 @@
   ([#187](https://github.com/fastly/Viceroy/pull/187))
 
 ## 0.3.0 (2022-10-11)
+
 - Tagged but not released due to invalid metadata added in
   [#173](https://github.com/fastly/Viceroy/pull/189). See
   [#189](https://github.com/fastly/Viceroy/pull/189) for more details
@@ -488,6 +541,7 @@
 ## 0.2.3 (2021-08-23)
 
 ### Additions
+
 - Added the close functionality for `RequestHandle`, `ResponseHandle`,
   `BodyHandle`, and `StreamingBodyHandle` in the upcoming Rust Compute `0.8.0` SDK
   release ([#65](https://github.com/fastly/Viceroy/pull/65))
@@ -495,6 +549,7 @@
 - Added the ability to do host overrides from the TOML configuration ([#48](https://github.com/fastly/Viceroy/pull/48))
 
 ### Changes
+
 - Viceroy now tracks the latest stable Rust which as of this release is 1.54.0
 
 ## 0.2.2 (2021-07-15)

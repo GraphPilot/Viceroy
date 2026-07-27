@@ -10,16 +10,17 @@ use {
         cache::Cache,
         component as compute,
         config::{
-            Backends, DeviceDetection, Dictionaries, ExperimentalModule, Geolocation,
-            UnknownImportBehavior,
+            Backends, DeviceDetection, Dictionaries, ExperimentalModule, FakeValidFastlyKeys,
+            Geolocation, UnknownImportBehavior,
         },
         downstream::{DownstreamMetadata, DownstreamRequest, DownstreamResponse, prepare_request},
         error::{ExecutionError, NonHttpResponse},
+        handoff::{HandoffConfig, HandoffRequestInfo, HandoffTlsConfig, perform_handoff},
+        http::framing::apply_response_framing,
         linking::{ComponentCtx, WasmCtx, create_store, link_host_functions},
         object_store::ObjectStores,
-        pushpin::{PushpinRedirectRequestInfo, proxy_through_pushpin},
+        sandbox::Sandbox,
         secret_store::SecretStores,
-        session::Session,
         shielding_site::ShieldingSites,
         upstream::TlsConfig,
     },
@@ -45,6 +46,7 @@ use {
         time::{Duration, Instant, SystemTime},
     },
     tokio::sync::Mutex as AsyncMutex,
+    tokio::sync::mpsc,
     tokio::sync::oneshot::{self, Sender},
     tracing::{Instrument, Level, error, event, info, info_span, warn},
     wasmtime::{
@@ -54,6 +56,8 @@ use {
     wasmtime_wasi::I32Exit,
 };
 
+pub use wasmtime::WasmFeatures;
+
 pub const DEFAULT_EPOCH_INTERRUPTION_PERIOD: Duration = Duration::from_micros(50);
 
 const NEXT_REQ_PENDING_MAX: usize = 5;
@@ -61,14 +65,17 @@ const REGION_NONE: &str = "none";
 
 enum Instance {
     Module(Module, InstancePre<WasmCtx>),
-    Component(compute::bindings::AdapterServicePre<ComponentCtx>),
+    Component(
+        Component,
+        compute::bindings::AdapterServicePre<ComponentCtx>,
+    ),
 }
 
 impl Instance {
     fn unwrap_module(&self) -> (&Module, &InstancePre<WasmCtx>) {
         match self {
             Instance::Module(m, i) => (m, i),
-            Instance::Component(_) => panic!("unwrap_module called on a component"),
+            Instance::Component(_, _) => panic!("unwrap_module called on a component"),
         }
     }
 }
@@ -83,11 +90,11 @@ pub struct GuestProfileConfig {
     pub sample_period: Duration,
 }
 
-pub struct NextRequest(Option<(DownstreamRequest, Arc<ExecuteCtx>)>);
+pub struct NextRequest(Option<(Box<DownstreamRequest>, Arc<ExecuteCtx>)>);
 
 impl NextRequest {
     pub fn into_request(mut self) -> Option<DownstreamRequest> {
-        self.0.take().map(|(r, _)| r)
+        self.0.take().map(|(r, _)| *r)
     }
 }
 
@@ -106,7 +113,7 @@ impl Drop for NextRequest {
             return;
         };
 
-        ctx.retry_request(req);
+        ctx.retry_request(*req);
     }
 }
 
@@ -150,9 +157,11 @@ pub struct ExecuteCtx {
     secret_stores: SecretStores,
     /// The shielding sites for this execution.
     shielding_sites: ShieldingSites,
+    /// The valid mock Fastly API keys that should be considered valid.
+    fake_valid_fastly_keys: FakeValidFastlyKeys,
     /// The cache for this service.
     cache: Arc<Cache>,
-    /// Senders waiting for new requests for reusable sessions.
+    /// Senders waiting for new requests for reusable sandboxes.
     pending_reuse: Arc<AsyncMutex<Vec<Sender<NextRequest>>>>,
     epoch_increment_thread: Option<JoinHandle<()>>,
     // `Arc` so that it can be tracked both by this context and `epoch_increment_thread`.
@@ -170,6 +179,7 @@ impl ExecuteCtx {
         guest_profile_config: Option<GuestProfileConfig>,
         unknown_import_behavior: UnknownImportBehavior,
         adapt_components: bool,
+        wasm_features: WasmFeatures,
     ) -> Result<ExecuteCtxBuilder, Error> {
         let input = fs::read(&module_path)?;
 
@@ -197,7 +207,7 @@ impl ExecuteCtx {
             (is_wat, is_component, input)
         };
 
-        let config = &configure_wasmtime(is_component, profiling_strategy);
+        let config = &configure_wasmtime(wasm_features, profiling_strategy);
         let engine = Engine::new(config)?;
         let instance_pre = if is_component {
             warn!(
@@ -245,7 +255,10 @@ impl ExecuteCtx {
             }
 
             let instance_pre = linker.instantiate_pre(&component)?;
-            Instance::Component(compute::bindings::AdapterServicePre::new(instance_pre)?)
+            Instance::Component(
+                component,
+                compute::bindings::AdapterServicePre::new(instance_pre)?,
+            )
         } else {
             let mut linker = Linker::new(&engine);
             link_host_functions(&mut linker, &wasi_modules)?;
@@ -301,9 +314,10 @@ impl ExecuteCtx {
             object_store: ObjectStores::new(),
             secret_stores: SecretStores::new(),
             shielding_sites: ShieldingSites::new(),
+            fake_valid_fastly_keys: FakeValidFastlyKeys::new(),
             epoch_increment_thread,
             epoch_increment_stop,
-            guest_profile_config: guest_profile_config.map(|c| Arc::new(c)),
+            guest_profile_config: guest_profile_config.map(Arc::new),
             cache: Arc::new(Cache::default()),
             pending_reuse: Arc::new(AsyncMutex::new(vec![])),
         };
@@ -319,6 +333,7 @@ impl ExecuteCtx {
         guest_profile_config: Option<GuestProfileConfig>,
         unknown_import_behavior: UnknownImportBehavior,
         adapt_components: bool,
+        wasm_features: WasmFeatures,
     ) -> Result<Arc<Self>, Error> {
         ExecuteCtx::build(
             module_path,
@@ -327,6 +342,7 @@ impl ExecuteCtx {
             guest_profile_config,
             unknown_import_behavior,
             adapt_components,
+            wasm_features,
         )?
         .finish()
     }
@@ -382,14 +398,54 @@ impl ExecuteCtx {
     }
 
     async fn maybe_receive_response(
-        receiver: oneshot::Receiver<DownstreamResponse>,
+        mut receiver: mpsc::Receiver<DownstreamResponse>,
     ) -> Option<(Response<Body>, Option<anyhow::Error>)> {
-        match receiver.await.ok()? {
-            DownstreamResponse::Http(resp) => Some((resp, None)),
-            DownstreamResponse::RedirectToPushpin(info) => Some((
-                Response::new(Body::empty()),
-                Some(NonHttpResponse::PushpinRedirect(info).into()),
-            )),
+        loop {
+            match receiver.recv().await? {
+                DownstreamResponse::Http(mut resp) => {
+                    apply_response_framing(&mut resp);
+
+                    // Supporting 103 Early Hints responses is currently infeasible, as Hyper does
+                    // not support sending multiple responses on a single connection. But we don't
+                    // want to generate errors for them either. Early Hints will be dropped, but
+                    // logged so that people will know they *did work*, even though they won't
+                    // reach the client.
+                    if resp.status().is_informational() {
+                        // We'll do these at different log levels in case someone wants to squelch some.
+                        tracing::warn!(
+                            "Guest returned informational response ({}) which will not be sent to the client",
+                            resp.status(),
+                        );
+                        tracing::info!("{:#?}", resp);
+                        continue;
+                    }
+
+                    return Some((resp, None));
+                }
+                DownstreamResponse::Pending(pending) => {
+                    let mut resp = pending
+                        .recv_or_else(|e| {
+                            let status = e.as_status_code();
+                            let err = anyhow::Error::from(e);
+                            anyhow_response_with_status(&err, status)
+                        })
+                        .await;
+
+                    apply_response_framing(&mut resp);
+
+                    return Some((resp, None));
+                }
+                DownstreamResponse::HandoffToPushpin(info) => {
+                    let err = NonHttpResponse::HandoffToPushpin(info).into();
+                    let resp = Response::new(Body::empty());
+                    return Some((resp, Some(err)));
+                }
+                DownstreamResponse::HandoffToBackend(info) => {
+                    let resp = Response::new(Body::empty());
+                    let err = NonHttpResponse::HandoffToBackend(info).into();
+                    return Some((resp, Some(err)));
+                }
+            }
         }
     }
 
@@ -408,12 +464,22 @@ impl ExecuteCtx {
     ///
     /// ```no_run
     /// # use std::collections::HashSet;
+    /// # use wasmtime::WasmFeatures;
     /// use hyper::{Body, http::Request};
     /// # use viceroy_lib::{Error, ExecuteCtx, ProfilingStrategy, ViceroyService};
     /// # async fn f() -> Result<(), Error> {
     /// # let req = Request::new(Body::from(""));
     /// let adapt_core_wasm = false;
-    /// let ctx = ExecuteCtx::new("path/to/a/file.wasm", ProfilingStrategy::None, HashSet::new(), None, Default::default(), adapt_core_wasm)?;
+    /// let wasm_features = WasmFeatures::default();
+    /// let ctx = ExecuteCtx::new(
+    ///     "path/to/a/file.wasm",
+    ///     ProfilingStrategy::None,
+    ///     HashSet::new(),
+    ///     None,
+    ///     Default::default(),
+    ///     adapt_core_wasm,
+    ///     wasm_features
+    /// )?;
     /// let local = "127.0.0.1:80".parse().unwrap();
     /// let remote = "127.0.0.1:0".parse().unwrap();
     /// let resp = ctx.handle_request(req, local, remote).await?;
@@ -431,8 +497,7 @@ impl ExecuteCtx {
         let local_pushpin_proxy_port = self.local_pushpin_proxy_port;
 
         let (body_for_wasm, orig_body_tee) = tee(incoming_req_body).await;
-        let orig_request_info_for_pushpin =
-            PushpinRedirectRequestInfo::from_parts(&incoming_req_parts);
+        let orig_request_info_for_pushpin = HandoffRequestInfo::from_parts(&incoming_req_parts);
 
         let original_headers = incoming_req_parts.headers.clone();
         let req = prepare_request(Request::from_parts(incoming_req_parts, body_for_wasm))?;
@@ -449,6 +514,9 @@ impl ExecuteCtx {
             original_headers,
         };
 
+        let backends = self.backends.clone();
+        let tls_config = self.tls_config.clone();
+
         let (resp, mut err) = self.reuse_or_spawn_guest(req, metadata).await;
 
         let span = info_span!("request", id = req_id);
@@ -458,36 +526,129 @@ impl ExecuteCtx {
 
         if let Some(e) = err {
             match e.downcast::<NonHttpResponse>() {
-                Ok(NonHttpResponse::PushpinRedirect(redirect_info)) => {
-                    let backend_name = redirect_info.backend_name;
-                    let redirect_request_info = redirect_info.request_info;
-                    info!("Pushpin redirect signaled to backend '{}'", backend_name);
+                Ok(NonHttpResponse::HandoffToPushpin(handoff_info)) => {
+                    let backend_name = handoff_info.backend_name.clone();
+
+                    info!("Pushpin handoff signaled to backend '{backend_name}'");
 
                     let local_pushpin_proxy_port = match local_pushpin_proxy_port {
                         None => {
-                            error!("Pushpin redirect signaled, but Pushpin mode not enabled.");
-                            let err = anyhow::anyhow!(
-                                "Pushpin redirect signaled, but Pushpin mode not enabled."
-                            );
-                            let resp = Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::from(hyper::Body::from(err.to_string())))?;
-                            return Ok((resp, Some(err)));
+                            error!("Pushpin handoff signaled, but Pushpin mode not enabled.");
+                            let mut resp = Response::new(Body::from(hyper::Body::from(
+                                "Pushpin handoff signaled, but Pushpin mode not enabled.",
+                            )));
+                            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok((resp, None));
                         }
                         Some(port) => port,
                     };
 
-                    let proxy_resp = proxy_through_pushpin(
-                        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), local_pushpin_proxy_port),
-                        backend_name,
-                        redirect_request_info,
+                    let pushpin_addr =
+                        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), local_pushpin_proxy_port)
+                            .to_string();
+
+                    // To distinguish backends, the HTTP request header `pushpin-route: <backend_name>` is added
+                    // to the request. Pushpin routes should be configured with `id=<backend_name>`.
+                    let additional_headers =
+                        vec![("pushpin-route".to_string(), backend_name.clone())];
+
+                    let handoff_resp = perform_handoff(
+                        handoff_info.request_info,
                         orig_request_info_for_pushpin,
                         orig_body_tee,
                         orig_req_on_upgrade,
+                        HandoffConfig {
+                            target_addr: pushpin_addr.clone(),
+                            host_header: pushpin_addr, // Host header is the local proxy address
+                            display_name: format!("Pushpin [{backend_name}]"),
+                            path_prefix: None, // Path prefix is applied by Pushpin route
+                            extra_headers: additional_headers,
+                            tls_config: None, // Pushpin only runs locally, without https
+                        },
                     )
                     .await;
 
-                    let (p, hyper_body) = proxy_resp.into_parts();
+                    let (p, hyper_body) = handoff_resp.into_parts();
+                    return Ok((Response::from_parts(p, Body::from(hyper_body)), None));
+                }
+                Ok(NonHttpResponse::HandoffToBackend(handoff_info)) => {
+                    let backend_name = handoff_info.backend_name.clone();
+
+                    info!("Backend handoff signaled to backend '{backend_name}'");
+
+                    let backend = backends.get(backend_name.as_str());
+                    let backend = match backend {
+                        None => {
+                            error!("Backend handoff signaled to unknown backend '{backend_name}'.");
+                            let mut resp = Response::new(Body::from(hyper::Body::from(format!(
+                                "Backend handoff signaled to unknown backend '{backend_name}'."
+                            ))));
+                            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok((resp, None));
+                        }
+                        Some(backend) => backend,
+                    };
+
+                    let backend_uri = backend.uri.clone();
+                    let tls_handoff_config =
+                        if matches!(backend_uri.scheme_str(), Some("https" | "wss")) {
+                            Some(HandoffTlsConfig {
+                                ca_certs: backend.ca_certs.clone(),
+                                client_cert: backend.client_cert.clone(),
+                                use_sni: backend.use_sni,
+                                cert_host: backend.cert_host.clone(),
+                                dns_name_fallback: backend
+                                    .uri
+                                    .host()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                is_grpc: backend.grpc,
+                                base_tls_config: tls_config.clone(), // Pass the builder from self
+                            })
+                        } else {
+                            None
+                        };
+
+                    let backend_host = backend_uri
+                        .authority()
+                        .map(|a| match (a.port(), backend_uri.scheme_str()) {
+                            (None, Some("wss")) => format!("{}:443", a),
+                            (None, Some("https")) => format!("{}:443", a),
+                            (None, Some("ws")) => format!("{}:80", a),
+                            (None, Some("http")) => format!("{}:80", a),
+                            _ => a.to_string(), // already has a port, or scheme is unknown (unlikely)
+                        })
+                        .unwrap_or_default();
+                    // Use override_host if present, otherwise fallback to the URI's authority
+                    let host_header = backend
+                        .override_host
+                        .clone()
+                        .map(|host| host.to_str()
+                            .expect("`backend.override_host`, if provided, should be a valid header value")
+                            .to_string())
+                        .unwrap_or_else(|| backend_host.clone());
+
+                    // Prepend a path if there's actually a path in the backend URI
+                    let path_prefix = (!backend_uri.path().is_empty() && backend_uri.path() != "/")
+                        .then(|| backend_uri.path().to_string());
+
+                    let handoff_resp = perform_handoff(
+                        handoff_info.request_info,
+                        orig_request_info_for_pushpin,
+                        orig_body_tee,
+                        orig_req_on_upgrade,
+                        HandoffConfig {
+                            target_addr: backend_host,
+                            host_header,
+                            display_name: format!("Backend [{backend_name}]"),
+                            path_prefix,
+                            extra_headers: vec![], // Standard backends don't need extra headers
+                            tls_config: tls_handoff_config,
+                        },
+                    )
+                    .await;
+
+                    let (p, hyper_body) = handoff_resp.into_parts();
                     return Ok((Response::from_parts(p, Body::from(hyper_body)), None));
                 }
                 Err(e) => {
@@ -500,18 +661,18 @@ impl ExecuteCtx {
     }
 
     /// Spawn a new guest to process a request whose processing was never attempted by
-    /// a reused session.
+    /// a reused sandbox.
     pub(crate) fn retry_request(self: Arc<Self>, mut downstream: DownstreamRequest) {
         if downstream.sender.is_closed() {
             return;
         }
 
         tokio::task::spawn(async move {
-            let (sender, receiver) = oneshot::channel();
+            let (sender, receiver) = mpsc::channel(10);
             let original = std::mem::replace(&mut downstream.sender, sender);
             let (resp, err) = self.spawn_guest(downstream, receiver).await;
             let resp = guest_result_to_response(resp, err);
-            let _ = original.send(DownstreamResponse::Http(resp));
+            let _ = original.send(DownstreamResponse::Http(resp)).await;
         });
     }
 
@@ -532,14 +693,9 @@ impl ExecuteCtx {
         req: Request<Body>,
         metadata: DownstreamMetadata,
     ) -> (Response<Body>, Option<anyhow::Error>) {
-        let (sender, receiver) = oneshot::channel();
-        let downstream = DownstreamRequest {
-            req,
-            sender,
-            metadata,
-        };
+        let (downstream, receiver) = DownstreamRequest::new(req, metadata);
 
-        let mut next_req = NextRequest(Some((downstream, self.clone())));
+        let mut next_req = NextRequest(Some((Box::new(downstream), self.clone())));
         let mut reusable = self.pending_reuse.lock().await;
 
         while let Some(pending) = reusable.pop() {
@@ -568,7 +724,7 @@ impl ExecuteCtx {
     async fn spawn_guest(
         self: Arc<Self>,
         downstream: DownstreamRequest,
-        receiver: oneshot::Receiver<DownstreamResponse>,
+        receiver: mpsc::Receiver<DownstreamResponse>,
     ) -> (Response<Body>, Option<anyhow::Error>) {
         let active_cpu_time_us = Arc::new(AtomicU64::new(0));
 
@@ -614,7 +770,7 @@ impl ExecuteCtx {
         );
         let start_timestamp = Instant::now();
         let req_id = downstream.metadata.req_id;
-        let session = Session::new(downstream, active_cpu_time_us, self.clone());
+        let sandbox = Sandbox::new(downstream, active_cpu_time_us, self.clone());
 
         let guest_profile_path = self.guest_profile_config.as_deref().map(|pcfg| {
             let now = SystemTime::now()
@@ -625,15 +781,21 @@ impl ExecuteCtx {
         });
 
         match self.instance_pre.as_ref() {
-            Instance::Component(instance_pre) => {
-                if self.guest_profile_config.is_some() {
-                    warn!("Components do not currently support the guest profiler");
-                }
+            Instance::Component(component, instance_pre) => {
+                let profiler = self.guest_profile_config.as_deref().map(|pcfg| {
+                    let program_name = "main";
+                    GuestProfiler::new_component(
+                        program_name,
+                        pcfg.sample_period,
+                        component.clone(),
+                        std::iter::empty(),
+                    )
+                });
 
-                let req = session.downstream_request();
-                let body = session.downstream_request_body();
+                let req = sandbox.downstream_request();
+                let body = sandbox.downstream_request_body();
 
-                let mut store = ComponentCtx::create_store(&self, session, None, |ctx| {
+                let mut store = ComponentCtx::create_store(&self, sandbox, profiler, |ctx| {
                     ctx.arg("compute-app");
                 })
                 .map_err(ExecutionError::Context)?;
@@ -671,6 +833,9 @@ impl ExecuteCtx {
                     }
                 };
 
+                // If we collected a profile, write it to the file
+                write_profile_component(&mut store, guest_profile_path.as_ref());
+
                 // Ensure the downstream response channel is closed, whether or not a response was
                 // sent during execution.
                 let resp = outcome
@@ -680,7 +845,7 @@ impl ExecuteCtx {
                     .unwrap_or_default();
                 store
                     .data_mut()
-                    .session
+                    .sandbox
                     .close_downstream_response_sender(resp);
 
                 let request_duration = Instant::now().duration_since(start_timestamp);
@@ -709,7 +874,7 @@ impl ExecuteCtx {
                 // due to wasmtime limitations, in particular the fact that `Instance` is not `Send`.
                 // However, the fact that the module itself is created within `ExecuteCtx::new`
                 // means that the heavy lifting happens only once.
-                let mut store = create_store(&self, session, profiler, |ctx| {
+                let mut store = create_store(&self, sandbox, profiler, |ctx| {
                     ctx.arg("compute-app");
                 })
                 .map_err(ExecutionError::Context)?;
@@ -783,17 +948,12 @@ impl ExecuteCtx {
             compliance_region: String::from(REGION_NONE),
             original_headers: Default::default(),
         };
-        let (sender, receiver) = oneshot::channel();
-        let downstream = DownstreamRequest {
-            req,
-            sender,
-            metadata,
-        };
+        let (downstream, receiver) = DownstreamRequest::new(req, metadata);
         let active_cpu_time_us = Arc::new(AtomicU64::new(0));
 
-        let session = Session::new(downstream, active_cpu_time_us.clone(), self.clone());
+        let sandbox = Sandbox::new(downstream, active_cpu_time_us.clone(), self.clone());
 
-        if let Instance::Component(_) = self.instance_pre.as_ref() {
+        if let Instance::Component(_, _) = self.instance_pre.as_ref() {
             panic!("components not currently supported with `run`");
         }
 
@@ -807,7 +967,7 @@ impl ExecuteCtx {
             )
         });
 
-        let mut store = create_store(&self, session, profiler, |builder| {
+        let mut store = create_store(&self, sandbox, profiler, |builder| {
             builder.arg(program_name);
             for arg in args {
                 builder.arg(arg);
@@ -870,6 +1030,11 @@ impl ExecuteCtx {
         &self.shielding_sites
     }
 
+    /// Get the valid mock Fastly API keys for this execution context.
+    pub fn fake_valid_fastly_keys(&self) -> &FakeValidFastlyKeys {
+        &self.fake_valid_fastly_keys
+    }
+
     pub async fn register_pending_downstream(&self) -> Option<oneshot::Receiver<NextRequest>> {
         let mut pending = self.pending_reuse.lock().await;
 
@@ -884,7 +1049,7 @@ impl ExecuteCtx {
     }
 
     pub fn is_component(&self) -> bool {
-        matches!(self.instance_pre.as_ref(), Instance::Component(_))
+        matches!(self.instance_pre.as_ref(), Instance::Component(_, _))
     }
 }
 
@@ -944,6 +1109,15 @@ impl ExecuteCtxBuilder {
         self
     }
 
+    /// Set the valid mock Fastly API keys for this execution context.
+    pub fn with_fake_valid_fastly_keys(
+        mut self,
+        fake_valid_fastly_keys: FakeValidFastlyKeys,
+    ) -> Self {
+        self.inner.fake_valid_fastly_keys = fake_valid_fastly_keys;
+        self
+    }
+
     /// Set the path to the config for this execution context.
     pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
         self.inner.config_path = Some(config_path);
@@ -976,29 +1150,44 @@ impl ExecuteCtxBuilder {
     }
 }
 
+fn write_profile_to_file(profile: Box<GuestProfiler>, path: &PathBuf) {
+    match std::fs::File::create(path)
+        .map_err(anyhow::Error::new)
+        .and_then(|output| profile.finish(std::io::BufWriter::new(output)))
+    {
+        Err(e) => {
+            event!(
+                Level::ERROR,
+                "failed writing profile at {}: {e:#}",
+                path.display()
+            );
+        }
+        _ => {
+            event!(
+                Level::INFO,
+                "\nProfile written to: {}\nView this profile at https://profiler.firefox.com/.",
+                path.display()
+            );
+        }
+    }
+}
+
 fn write_profile(store: &mut wasmtime::Store<WasmCtx>, guest_profile_path: Option<&PathBuf>) {
     if let (Some(profile), Some(path)) =
         (store.data_mut().take_guest_profiler(), guest_profile_path)
     {
-        match std::fs::File::create(path)
-            .map_err(anyhow::Error::new)
-            .and_then(|output| profile.finish(std::io::BufWriter::new(output)))
-        {
-            Err(e) => {
-                event!(
-                    Level::ERROR,
-                    "failed writing profile at {}: {e:#}",
-                    path.display()
-                );
-            }
-            _ => {
-                event!(
-                    Level::INFO,
-                    "\nProfile written to: {}\nView this profile at https://profiler.firefox.com/.",
-                    path.display()
-                );
-            }
-        }
+        write_profile_to_file(profile, path);
+    }
+}
+
+fn write_profile_component(
+    store: &mut wasmtime::Store<ComponentCtx>,
+    guest_profile_path: Option<&PathBuf>,
+) {
+    if let (Some(profile), Some(path)) =
+        (store.data_mut().take_guest_profiler(), guest_profile_path)
+    {
+        write_profile_to_file(profile, path);
     }
 }
 
@@ -1015,8 +1204,12 @@ fn exec_err_to_response(err: &ExecutionError) -> Response<Body> {
 }
 
 fn anyhow_response(err: &anyhow::Error) -> Response<Body> {
+    anyhow_response_with_status(err, hyper::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn anyhow_response_with_status(err: &anyhow::Error, status: hyper::StatusCode) -> Response<Body> {
     Response::builder()
-        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+        .status(status)
         .body(Body::from(format!("{err:?}").into_bytes()))
         .unwrap()
 }
@@ -1031,7 +1224,7 @@ impl Drop for ExecuteCtx {
 }
 
 fn configure_wasmtime(
-    allow_components: bool,
+    wasm_features: WasmFeatures,
     profiling_strategy: ProfilingStrategy,
 ) -> wasmtime::Config {
     use wasmtime::{Config, InstanceAllocationStrategy, WasmBacktraceDetails};
@@ -1045,9 +1238,7 @@ fn configure_wasmtime(
 
     config.allocation_strategy(InstanceAllocationStrategy::OnDemand);
 
-    if allow_components {
-        config.wasm_component_model(true);
-    }
+    config.wasm_features(wasm_features, true);
 
     // Wasm permits the "relaxed" instructions to be nondeterministic
     // between runs, but requires them to be deterministic within runs.

@@ -2,9 +2,9 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::session::{AsyncItemHandle, Session};
+use crate::sandbox::{AsyncItemHandle, Sandbox};
 use crate::wiggle_abi::fastly_http_downstream::FastlyHttpDownstream;
-use crate::wiggle_abi::headers::HttpHeaders;
+use crate::wiggle_abi::headers::HttpHeadersRead;
 use crate::wiggle_abi::types::{
     BodyHandle, ClientCertVerifyResult, MultiValueCursor, MultiValueCursorResult,
     NextRequestOptions, NextRequestOptionsMask, RequestHandle, RequestPromiseHandle,
@@ -12,7 +12,7 @@ use crate::wiggle_abi::types::{
 
 use wiggle::{GuestMemory, GuestPtr};
 
-impl FastlyHttpDownstream for Session {
+impl FastlyHttpDownstream for Sandbox {
     async fn next_request(
         &mut self,
         memory: &mut GuestMemory<'_>,
@@ -296,14 +296,14 @@ impl FastlyHttpDownstream for Session {
         region_max_len: u32,
         nwritten_out: GuestPtr<u32>,
     ) -> Result<(), Error> {
-        let region = Session::downstream_compliance_region(self, handle)?
+        let region = Sandbox::downstream_compliance_region(self, handle)?
             .ok_or(Error::MissingDownstreamMetadata)?;
         let region_len = region.len();
 
         match u32::try_from(region_len) {
             Ok(region_len) if region_len <= region_max_len => {
                 memory.copy_from_slice(region.as_bytes(), region_out.as_array(region_len))?;
-                memory.write(nwritten_out, region_len.try_into().unwrap_or(0))?;
+                memory.write(nwritten_out, region_len)?;
 
                 Ok(())
             }
@@ -321,48 +321,108 @@ impl FastlyHttpDownstream for Session {
     fn fastly_key_is_valid(
         &mut self,
         _memory: &mut GuestMemory<'_>,
-        _handle: RequestHandle,
+        handle: RequestHandle,
     ) -> Result<u32, Error> {
-        // Since there are no keys to compare against, just return false.
-        Ok(0)
+        self.check_fastly_key(handle).map(u32::from)
     }
 
     fn downstream_bot_analyzed(
         &mut self,
         _memory: &mut GuestMemory<'_>,
-        _handle: RequestHandle,
+        handle: RequestHandle,
     ) -> Result<u32, Error> {
-        Ok(0)
+        let headers = self
+            .downstream_original_headers(handle)?
+            .ok_or(Error::MissingDownstreamMetadata)?;
+        Ok(headers
+            .get("x-fastly-bot-analyzed")
+            .map(|a| a == "true")
+            .map(|a| if a { 1 } else { 0 })
+            .unwrap_or_default())
     }
 
     fn downstream_bot_detected(
         &mut self,
         _memory: &mut GuestMemory<'_>,
-        _handle: RequestHandle,
+        handle: RequestHandle,
     ) -> Result<u32, Error> {
-        Ok(0)
+        let headers = self
+            .downstream_original_headers(handle)?
+            .ok_or(Error::MissingDownstreamMetadata)?;
+        Ok(headers
+            .get("x-fastly-bot-detected")
+            .map(|a| a == "true")
+            .map(|a| if a { 1 } else { 0 })
+            .unwrap_or_default())
     }
 
     fn downstream_bot_name(
         &mut self,
-        _memory: &mut GuestMemory<'_>,
+        memory: &mut GuestMemory<'_>,
         handle: RequestHandle,
-        _bot_name_out: GuestPtr<u8>,
-        _bot_name_max_len: u32,
-        _nwritten_out: GuestPtr<u32>,
+        bot_name_out: GuestPtr<u8>,
+        bot_name_max_len: u32,
+        nwritten_out: GuestPtr<u32>,
     ) -> Result<(), Error> {
-        self.absent_metadata_value(handle)
+        let name = self
+            .downstream_original_headers(handle)?
+            .ok_or(Error::MissingDownstreamMetadata)?
+            .get("x-fastly-bot-name")
+            .and_then(|n| n.to_str().ok())
+            .ok_or(Error::ValueAbsent)?;
+        let name_len = name.len();
+        match u32::try_from(name_len) {
+            Ok(name_len) if name_len <= bot_name_max_len => {
+                memory.copy_from_slice(name.as_bytes(), bot_name_out.as_array(name_len))?;
+                memory.write(nwritten_out, name_len)?;
+
+                Ok(())
+            }
+            too_large => {
+                memory.write(nwritten_out, too_large.unwrap_or(0))?;
+
+                Err(Error::BufferLengthError {
+                    buf: "bot_name_out",
+                    len: "bot_name_max_len",
+                })
+            }
+        }
     }
 
     fn downstream_bot_category(
         &mut self,
-        _memory: &mut GuestMemory<'_>,
+        memory: &mut GuestMemory<'_>,
         handle: RequestHandle,
-        _bot_category_out: GuestPtr<u8>,
-        _bot_category_max_len: u32,
-        _nwritten_out: GuestPtr<u32>,
+        bot_category_out: GuestPtr<u8>,
+        bot_category_max_len: u32,
+        nwritten_out: GuestPtr<u32>,
     ) -> Result<(), Error> {
-        self.absent_metadata_value(handle)
+        let category = self
+            .downstream_original_headers(handle)?
+            .ok_or(Error::MissingDownstreamMetadata)?
+            .get("x-fastly-bot-category")
+            .and_then(|n| n.to_str().ok())
+            .ok_or(Error::ValueAbsent)?;
+        let category_len = category.len();
+        match u32::try_from(category_len) {
+            Ok(category_len) if category_len <= bot_category_max_len => {
+                memory.copy_from_slice(
+                    category.as_bytes(),
+                    bot_category_out.as_array(category_len),
+                )?;
+                memory.write(nwritten_out, category_len)?;
+
+                Ok(())
+            }
+            too_large => {
+                memory.write(nwritten_out, too_large.unwrap_or(0))?;
+
+                Err(Error::BufferLengthError {
+                    buf: "bot_category_out",
+                    len: "bot_category_max_len",
+                })
+            }
+        }
     }
 
     fn downstream_bot_category_kind(
@@ -370,7 +430,34 @@ impl FastlyHttpDownstream for Session {
         _memory: &mut GuestMemory<'_>,
         handle: RequestHandle,
     ) -> Result<u32, Error> {
-        self.absent_metadata_value(handle)
+        Ok(
+            match self
+                .downstream_original_headers(handle)?
+                .ok_or(Error::MissingDownstreamMetadata)?
+                .get("x-fastly-bot-category")
+                .and_then(|n| n.to_str().ok())
+                .ok_or(Error::ValueAbsent)?
+                .to_lowercase()
+                .as_str()
+            {
+                "none" | "0" => 0,
+                "suspected" | "1" => 1,
+                "accessibility" | "2" => 2,
+                "ai-crawler" | "3" => 3,
+                "ai-fetcher" | "4" => 4,
+                "content-fetcher" | "5" => 5,
+                "monitoring-site-tools" | "6" => 6,
+                "online-marketing" | "7" => 7,
+                "page-preview" | "8" => 8,
+                "platform-integration" | "9" => 9,
+                "research" | "10" => 10,
+                "search-engine-crawler" | "11" => 11,
+                "search-engine-optimization" | "12" => 12,
+                "security-tools" | "13" => 13,
+                "headless" | "14" => 14,
+                other => other.parse().map_err(|_| Error::ValueAbsent)?,
+            },
+        )
     }
 
     fn downstream_bot_verified(
@@ -378,7 +465,121 @@ impl FastlyHttpDownstream for Session {
         _memory: &mut GuestMemory<'_>,
         handle: RequestHandle,
     ) -> Result<u32, Error> {
+        Ok(self
+            .downstream_original_headers(handle)?
+            .ok_or(Error::MissingDownstreamMetadata)?
+            .get("x-fastly-bot-verified")
+            .map(|a| a == "true")
+            .map(|a| if a { 1 } else { 0 })
+            .ok_or(Error::ValueAbsent)?)
+    }
+
+    fn downstream_resvpnproxy_is_anonymous(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
         self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_anonymous_vpn(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_hosting_provider(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_proxy_over_vpn(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_public_proxy(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_relay_proxy(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_residential_proxy(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_smart_dns_proxy(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_tor_exit_node(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_is_vpn_datacenter(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+    ) -> Result<u32, Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_resvpnproxy_vpn_service_name(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        handle: RequestHandle,
+        _name_out: GuestPtr<u8>,
+        _name_max_len: u32,
+        _nwritten_out: GuestPtr<u32>,
+    ) -> Result<(), Error> {
+        self.absent_metadata_value(handle)
+    }
+
+    fn downstream_visits_this_service(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+    ) -> Result<u32, Error> {
+        Err(Error::Unsupported {
+            msg: "`downstream_visits_this_service` not yet supported",
+        }
+        .into())
+    }
+
+    fn downstream_visits_this_pop(&mut self, _memory: &mut GuestMemory<'_>) -> Result<u32, Error> {
+        Err(Error::Unsupported {
+            msg: "`downstream_visits_this_pop` not yet supported",
+        }
+        .into())
     }
 }
 
@@ -386,7 +587,7 @@ trait MetadataView {
     /// Stub for metadata that Viceroy does not support. Validates the handle normally, but always returns Error::ValueAbsent rather than a meaningful value.
     fn absent_metadata_value<T>(&self, handle: RequestHandle) -> Result<T, Error>;
 }
-impl MetadataView for Session {
+impl MetadataView for Sandbox {
     fn absent_metadata_value<T>(&self, handle: RequestHandle) -> Result<T, Error> {
         let _ = self
             .downstream_metadata(handle)?

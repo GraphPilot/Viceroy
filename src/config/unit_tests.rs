@@ -57,7 +57,7 @@ fn fastly_toml_files_can_be_read() {
 fn fastly_toml_files_with_simple_backend_configurations_can_be_read() {
     let config = FastlyConfig::from_str(
         r#"
-            manifest_version = "1.2.3"
+            manifest_version = 3
             name = "backend-config-example"
             description = "a toml example with backend configuration"
             authors = [
@@ -111,7 +111,7 @@ fn fastly_toml_files_with_simple_dictionary_configurations_can_be_read() {
     writeln!(file, "{{}}").unwrap();
     let config = FastlyConfig::from_str(format!(
         r#"
-            manifest_version = "1.2.3"
+            manifest_version = 3
             name = "dictionary-config-example"
             description = "a toml example with dictionary configuration"
             authors = [
@@ -150,7 +150,7 @@ fn fastly_toml_files_with_simple_config_store_configurations_can_be_read() {
     writeln!(file, "{{}}").unwrap();
     let config = FastlyConfig::from_str(format!(
         r#"
-            manifest_version = "1.2.3"
+            manifest_version = 3
             name = "dictionary-config-example"
             description = "a toml example with config store configuration"
             authors = [
@@ -339,6 +339,76 @@ mod backend_config_tests {
         match read_local_server_config(BAD_OVERRIDE_HOST_FIELD) {
             Err(InvalidBackendDefinition {
                 err: InvalidOverrideHost(_),
+                ..
+            }) => {}
+            res => panic!("unexpected result: {:?}", res),
+        }
+    }
+
+    /// Check that backend health field accepts valid values.
+    #[test]
+    fn backend_configs_can_provide_health_status() {
+        let config_with_health = r#"
+            [backends]
+            [backends.healthy_backend]
+            url = "http://a.com"
+            health = "healthy"
+
+            [backends.unhealthy_backend]
+            url = "http://b.com"
+            health = "unhealthy"
+
+            [backends.unknown_backend]
+            url = "http://c.com"
+            health = "unknown"
+
+            [backends.default_backend]
+            url = "http://d.com"
+        "#;
+        let config = read_local_server_config(config_with_health)
+            .expect("can read backend config with health status");
+
+        let healthy = config.backends.0.get("healthy_backend").unwrap();
+        assert_eq!(healthy.health, crate::config::BackendHealth::Healthy);
+
+        let unhealthy = config.backends.0.get("unhealthy_backend").unwrap();
+        assert_eq!(unhealthy.health, crate::config::BackendHealth::Unhealthy);
+
+        let unknown = config.backends.0.get("unknown_backend").unwrap();
+        assert_eq!(unknown.health, crate::config::BackendHealth::Unknown);
+
+        let default = config.backends.0.get("default_backend").unwrap();
+        assert_eq!(default.health, crate::config::BackendHealth::Unknown);
+    }
+
+    /// Check that health field must have valid value.
+    #[test]
+    fn backend_configs_health_must_be_valid() {
+        use BackendConfigError::InvalidHealthEntry;
+        static BAD_HEALTH_FIELD: &str = r#"
+            [backends]
+            "shark" = { url = "http://a.com", health = "sick" }
+        "#;
+        match read_local_server_config(BAD_HEALTH_FIELD) {
+            Err(InvalidBackendDefinition {
+                err: InvalidHealthEntry(value),
+                ..
+            }) if value == "sick" => {}
+            res => panic!("unexpected result: {:?}", res),
+        }
+    }
+
+    /// Check that health field must be a string.
+    #[test]
+    fn backend_configs_health_must_be_string() {
+        use BackendConfigError::InvalidHealthEntry;
+        static BAD_HEALTH_FIELD: &str = r#"
+            [backends]
+            "shark" = { url = "http://a.com", health = true }
+        "#;
+        match read_local_server_config(BAD_HEALTH_FIELD) {
+            Err(InvalidBackendDefinition {
+                err: InvalidHealthEntry(_),
                 ..
             }) => {}
             res => panic!("unexpected result: {:?}", res),
@@ -1215,4 +1285,72 @@ Qq7tJAMLnPnAdAUousI0RDcLpB8adGkhZH66lL4oV9U+aQ0dA0oiqSKZtMoHeWbr
             .expect("no blåhaj :(");
         assert_eq!(3, shark_backend.ca_certs.len());
     }
+}
+
+#[test]
+fn fastly_toml_files_with_unsupported_manifest_version() {
+    let err = FastlyConfig::from_str(
+        r#"
+            manifest_version = 4
+            name = "backend-config-example"
+            language = "rust"
+    "#,
+    )
+    .expect_err("an unsupported manifest_version should have evoked an error");
+
+    assert!(matches!(
+        err,
+        FastlyConfigError::UnsupportedManifestVersion(4, 3)
+    ));
+}
+
+#[test]
+fn fastly_toml_with_fake_valid_fastly_keys() {
+    let config = FastlyConfig::from_str(
+        r#"
+            manifest_version = 3
+            name = "api-keys-example"
+            language = "rust"
+
+            [local_server]
+            fake_valid_fastly_keys = ["test-key-1", "test-key-2"]
+    "#,
+    )
+    .expect("can read toml data");
+
+    let keys = config.fake_valid_fastly_keys();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains("test-key-1"));
+    assert!(keys.contains("test-key-2"));
+}
+
+#[test]
+fn fastly_toml_without_fake_valid_fastly_keys_defaults_to_empty() {
+    let config = FastlyConfig::from_str(
+        r#"
+            manifest_version = 3
+            name = "no-api-keys-example"
+            language = "rust"
+    "#,
+    )
+    .expect("can read toml data");
+
+    assert!(config.fake_valid_fastly_keys().is_empty());
+}
+
+#[test]
+fn fastly_toml_with_empty_fake_valid_fastly_keys() {
+    let config = FastlyConfig::from_str(
+        r#"
+            manifest_version = 3
+            name = "empty-api-keys-example"
+            language = "rust"
+
+            [local_server]
+            fake_valid_fastly_keys = []
+    "#,
+    )
+    .expect("can read toml data");
+
+    assert!(config.fake_valid_fastly_keys().is_empty());
 }

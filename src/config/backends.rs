@@ -6,6 +6,19 @@ use {
 };
 
 pub use self::client_cert_info::{ClientCertError, ClientCertInfo};
+use std::time::Duration;
+
+/// Backend health status for testing purposes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BackendHealth {
+    /// Health status is unknown (default).
+    #[default]
+    Unknown,
+    /// Backend is healthy.
+    Healthy,
+    /// Backend is unhealthy.
+    Unhealthy,
+}
 
 /// A single backend definition.
 #[derive(Clone, Debug)]
@@ -15,8 +28,11 @@ pub struct Backend {
     pub cert_host: Option<String>,
     pub use_sni: bool,
     pub grpc: bool,
+    pub first_byte_timeout: Option<Duration>,
+    pub between_bytes_timeout: Option<Duration>,
     pub client_cert: Option<ClientCertInfo>,
     pub ca_certs: Vec<rustls::Certificate>,
+    pub health: BackendHealth,
 }
 
 /// A map of [`Backend`] definitions, keyed by their name.
@@ -34,6 +50,7 @@ mod deserialization {
         crate::error::{BackendConfigError, FastlyConfigError},
         hyper::{Uri, header::HeaderValue},
         std::sync::Arc,
+        std::time::Duration,
         toml::value::{Table, Value},
     };
 
@@ -148,6 +165,49 @@ mod deserialization {
                 })
                 .transpose()?
                 .unwrap_or(false);
+            let first_byte_timeout = toml
+                .remove("first_byte_timeout_ms")
+                .map(|x| {
+                    if let Value::Integer(timeout_ms) = x
+                        && timeout_ms >= 0
+                    {
+                        Ok(Duration::from_millis(timeout_ms as u64))
+                    } else {
+                        Err(BackendConfigError::InvalidTimeoutValue)
+                    }
+                })
+                .transpose()?;
+            let between_bytes_timeout = toml
+                .remove("between_bytes_timeout_ms")
+                .map(|x| {
+                    if let Value::Integer(timeout_ms) = x
+                        && timeout_ms >= 0
+                    {
+                        Ok(Duration::from_millis(timeout_ms as u64))
+                    } else {
+                        Err(BackendConfigError::InvalidTimeoutValue)
+                    }
+                })
+                .transpose()?;
+
+            let health = toml
+                .remove("health")
+                .map(|health| match health {
+                    Value::String(health) => {
+                        let health_lower = health.to_lowercase();
+                        match health_lower.as_str() {
+                            "unknown" => Ok(super::BackendHealth::Unknown),
+                            "healthy" => Ok(super::BackendHealth::Healthy),
+                            "unhealthy" => Ok(super::BackendHealth::Unhealthy),
+                            _ => Err(BackendConfigError::InvalidHealthEntry(health)),
+                        }
+                    }
+                    _ => Err(BackendConfigError::InvalidHealthEntry(
+                        "not a string".to_string(),
+                    )),
+                })
+                .transpose()?
+                .unwrap_or_default();
 
             check_for_unrecognized_keys(&toml)?;
 
@@ -158,7 +218,10 @@ mod deserialization {
                 use_sni,
                 client_cert,
                 grpc,
+                first_byte_timeout,
+                between_bytes_timeout,
                 ca_certs,
+                health,
             })
         }
     }

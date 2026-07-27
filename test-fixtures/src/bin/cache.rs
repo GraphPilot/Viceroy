@@ -40,6 +40,7 @@ fn main() {
     run_test!(test_vary_combine);
 
     run_test!(test_length_from_body);
+    run_test!(test_length_locked_at_lookup);
     run_test!(test_inconsistent_body_length);
     run_test!(test_nonconcurrent_range);
     run_test!(test_concurrent_range);
@@ -64,6 +65,7 @@ fn main() {
     run_test!(test_implicit_cancel_of_pending);
     run_test!(test_explicit_cancel);
     run_test!(test_collapse_across_vary);
+    run_test!(test_collapse_from_later_vary);
 
     run_test!(test_stream_back);
     run_test!(test_stream_back_fixed);
@@ -439,7 +441,7 @@ fn test_novary_ignore_headers() {
 fn test_vary_subtle() {
     let key = new_key();
 
-    // A very subtle (hah!) case: can one header run in to another?
+    // A very subtle (hah!) case: can one header run into another?
 
     let h1 = HeaderName::from_static("x-viceroy-test");
     let h2 = HeaderName::from_static("x-viceroy-assert");
@@ -565,6 +567,44 @@ fn test_length_from_body() {
 
     let got = poll_known_length(&key);
     assert_eq!(got.known_length().unwrap(), body.len() as u64);
+}
+
+fn test_length_locked_at_lookup() {
+    // Length is locked-in at lookup time: a Found whose lookup happened while the body was still
+    // streaming must always report None for length, even after the stream completes.
+    // A *new* lookup after the stream finishes should immediately see the correct length.
+    let key = new_key();
+
+    let body = "hello world".as_bytes();
+    let mut writer = insert(key.clone(), Duration::from_secs(115))
+        .execute()
+        .unwrap();
+
+    // Lookup while the body is still streaming: length must be None.
+    let mid_stream = lookup(key.clone()).execute().unwrap().unwrap();
+    assert!(
+        mid_stream.known_length().is_none(),
+        "length must be None while body is still streaming"
+    );
+
+    writer.write_all(body).unwrap();
+    writer.finish().unwrap();
+
+    // The original Found must still report None after the stream completes.
+    // poll_known_length re-looks up until a new Found with known length appears, which confirms
+    // the body is fully collected by this point.
+    let post_stream = poll_known_length(&key);
+    assert_eq!(
+        post_stream.known_length(),
+        Some(body.len() as u64),
+        "a new lookup after body completion must report the correct length"
+    );
+
+    // The original mid-stream Found must remain locked at None.
+    assert!(
+        mid_stream.known_length().is_none(),
+        "length must remain None on the original Found even after body completes"
+    );
 }
 
 fn test_inconsistent_body_length() {
@@ -1200,6 +1240,66 @@ fn test_collapse_across_vary() {
     // because according to the most recent vary rule they are distinct.
     assert!(!txn2.pending().unwrap());
     assert!(!txn1.pending().unwrap());
+}
+
+fn test_collapse_from_later_vary() {
+    // Per issue #626: cache contains two stale variants under Vary: Header-A.
+    // Txn1 (foo), Txn2 (bar), Txn3 (bar) dispatch; Txn1 and Txn2 receive GoGet,
+    // Txn3 waits on Txn2. Txn1 completes with an *empty* vary rule, which can in
+    // principle fulfill Txn3. Txn2 is then abandoned. Txn3 should get Found.
+    let key = new_key();
+    let header_a = HeaderName::from_static("header-a");
+
+    let b = insert(key.clone(), Duration::ZERO)
+        .header(&header_a, "foo")
+        .vary_by([&header_a])
+        .execute()
+        .unwrap();
+    b.finish().unwrap();
+
+    let b = insert(key.clone(), Duration::ZERO)
+        .header(&header_a, "bar")
+        .vary_by([&header_a])
+        .execute()
+        .unwrap();
+    b.finish().unwrap();
+
+    let txn1 = Transaction::lookup(key.clone())
+        .header(&header_a, "foo")
+        .execute()
+        .unwrap();
+
+    let txn2 = Transaction::lookup(key.clone())
+        .header(&header_a, "bar")
+        .execute()
+        .unwrap();
+
+    let pending_txn3 = Transaction::lookup(key.clone())
+        .header(&header_a, "bar")
+        .execute_async()
+        .unwrap();
+    assert!(pending_txn3.pending().unwrap(), "txn3 should be waiting on txn2");
+    assert!(txn1.must_insert_or_update());
+    assert!(txn2.must_insert_or_update());
+
+    let mut writer = txn1.insert(Duration::from_secs(120)).execute().unwrap();
+    writer.write_all(b"the-response").unwrap();
+    writer.finish().unwrap();
+
+    // Abandon Txn2 to verify that Txn3 falls back to 
+    // Txn1's wildcard entry instead of spawning a duplicate origin fetch.
+    txn2.cancel_insert_or_update().unwrap();
+
+    // Txn3 must resolve as Found from Txn1's empty-vary insert.
+    let txn3 = pending_txn3.wait().unwrap();
+    assert!(
+        txn3.found().is_some(),
+        "txn3 should receive the cached entry from txn1's empty-vary insert"
+    );
+    assert!(
+        !txn3.must_insert_or_update(),
+        "txn3 must not be issued a GoGet"
+    );
 }
 
 fn test_stream_back() {

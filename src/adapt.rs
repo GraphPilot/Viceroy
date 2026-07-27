@@ -31,7 +31,9 @@ pub fn adapt_wat(wat: &str) -> anyhow::Result<Vec<u8>> {
 pub fn adapt_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     // Determine if we have a main module or a library module.
     let library = !has_export(bytes, "_start");
-    let needs_no_shift_adapter = has_wit_bindgen_imports(bytes);
+
+    // Wit-bindgen imports and exports need the noshift adapter.
+    let needs_no_shift_adapter = has_wit_bindgen_imports(bytes) || has_wit_bindgen_exports(bytes);
 
     let bytes = if needs_no_shift_adapter {
         bytes.to_vec()
@@ -87,7 +89,7 @@ pub fn adapt_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 fn mangle_imports(bytes: &[u8]) -> anyhow::Result<wasm_encoder::Module> {
     let mut module = wasm_encoder::Module::new();
 
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload?;
         match payload {
             wasmparser::Payload::Version {
@@ -102,30 +104,35 @@ fn mangle_imports(bytes: &[u8]) -> anyhow::Result<wasm_encoder::Module> {
 
                 for import in section {
                     let import = import?;
-                    let entity = wasm_encoder::EntityType::try_from(import.ty).map_err(|_| {
-                        anyhow::anyhow!(
-                            "Failed to translate type for import {}:{}",
-                            import.module,
-                            import.name
-                        )
-                    })?;
+                    for import in import {
+                        let import = import?;
+                        let import = import.1;
+                        let entity =
+                            wasm_encoder::EntityType::try_from(import.ty).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "Failed to translate type for import {}:{}",
+                                    import.module,
+                                    import.name
+                                )
+                            })?;
 
-                    if is_fastly_module(import.module) {
-                        // In order to build a single module that can serve as
-                        // the adapter for the many "fastly_*" modules we have,
-                        // as well as the "env" module we have, as well as for
-                        // the "wasi_snapshot_preview1" module, we mangle
-                        // "fastly_*" and "env" names and put them into the
-                        // "wasi_snapshot_preview1" module.
-                        let module = "wasi_snapshot_preview1";
-                        let name = format!("{}#{}", import.module, import.name);
-                        imports.import(module, &name, entity);
-                    } else {
-                        // It's not a "fastly_" module, so it may be
-                        // "wasi_snapshot_preview1" which we should leave as-is,
-                        // or a wit-bindgen-generated import which doesn't need
-                        // adapting.
-                        imports.import(import.module, import.name, entity);
+                        if is_fastly_module(import.module) {
+                            // In order to build a single module that can serve as
+                            // the adapter for the many "fastly_*" modules we have,
+                            // as well as the "env" module we have, as well as for
+                            // the "wasi_snapshot_preview1" module, we mangle
+                            // "fastly_*" and "env" names and put them into the
+                            // "wasi_snapshot_preview1" module.
+                            let module = "wasi_snapshot_preview1";
+                            let name = format!("{}#{}", import.module, import.name);
+                            imports.import(module, &name, entity);
+                        } else {
+                            // It's not a "fastly_" module, so it may be
+                            // "wasi_snapshot_preview1" which we should leave as-is,
+                            // or a wit-bindgen-generated import which doesn't need
+                            // adapting.
+                            imports.import(import.module, import.name, entity);
+                        }
                     }
                 }
 
@@ -148,22 +155,19 @@ fn mangle_imports(bytes: &[u8]) -> anyhow::Result<wasm_encoder::Module> {
 
 /// Test whether `bytes` holds a wasm binary with an export named `wanted`.
 fn has_export(bytes: &[u8], wanted: &str) -> bool {
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let Ok(payload) = payload else {
             return false;
         };
-        match payload {
-            wasmparser::Payload::ExportSection(section) => {
-                for export in section {
-                    let Ok(export) = export else {
-                        return false;
-                    };
-                    if export.name == wanted {
-                        return true;
-                    }
+        if let wasmparser::Payload::ExportSection(section) = payload {
+            for export in section {
+                let Ok(export) = export else {
+                    return false;
+                };
+                if export.name == wanted {
+                    return true;
                 }
             }
-            _ => {}
         }
     }
 
@@ -172,26 +176,80 @@ fn has_export(bytes: &[u8], wanted: &str) -> bool {
 fn is_fastly_module(module: &str) -> bool {
     module.starts_with("fastly_") || module == "env" || module == "fastly" || module == "xqd"
 }
+
+// Treat non-WASI, non-Fastly imports as wit-bindgen imports.
 fn has_wit_bindgen_imports(bytes: &[u8]) -> bool {
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let Ok(payload) = payload else {
             return false;
         };
-        match payload {
-            wasmparser::Payload::ImportSection(section) => {
-                for import in section {
+        if let wasmparser::Payload::ImportSection(section) = payload {
+            for import in section {
+                let Ok(import) = import else {
+                    return false;
+                };
+                for import in import {
                     let Ok(import) = import else {
                         return false;
                     };
+                    let import = import.1;
                     if !is_fastly_module(import.module) && import.module != "wasi_snapshot_preview1"
                     {
                         return true;
                     }
                 }
             }
-            _ => {}
         }
     }
 
     false
+}
+
+// Best-effort check for wit-bindgen export names, such as
+// `<package>:<interface>@<version>#<func>`. The Fastly SDK does not emit this
+// shape for plain wasip1 services.
+fn has_wit_bindgen_exports(bytes: &[u8]) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let Ok(payload) = payload else {
+            return false;
+        };
+        if let wasmparser::Payload::ExportSection(section) = payload {
+            for export in section {
+                let Ok(export) = export else {
+                    return false;
+                };
+                if export.name.contains(':') && export.name.contains('#') {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapt_bytes_marks_wit_bindgen_library_fixture_as_library_noshift() {
+        // Fixture generated from fastly/edge-storage's
+        // components/template/inspector-component crate and stripped with
+        // `wasm-tools strip --all`.
+        let adapted = adapt_bytes(include_bytes!(
+            "../tests/fixtures/template_inspector_component.wasm"
+        ))
+        .unwrap();
+
+        // Checking which adapter is used from the custom section.
+        assert!(contains_bytes(&adapted, b"viceroy adapt"));
+        assert!(contains_bytes(&adapted, b"(library, noshift)"));
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
 }

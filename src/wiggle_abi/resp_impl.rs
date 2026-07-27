@@ -3,14 +3,14 @@
 use {
     crate::{
         error::Error,
-        session::{Session, ViceroyResponseMetadata},
+        sandbox::{Sandbox, ViceroyResponseMetadata},
         upstream,
         wiggle_abi::{
             fastly_http_resp::FastlyHttpResp,
-            headers::HttpHeaders,
+            headers::{HttpHeadersRead, HttpHeadersWrite},
             types::{
                 BodyHandle, FramingHeadersMode, HttpKeepaliveMode, HttpStatus, HttpVersion,
-                MultiValueCursor, MultiValueCursorResult, ResponseHandle,
+                MultiValueCursor, MultiValueCursorResult, PendingRequestHandle, ResponseHandle,
             },
         },
     },
@@ -20,7 +20,7 @@ use {
     wiggle::{GuestMemory, GuestPtr},
 };
 
-impl FastlyHttpResp for Session {
+impl FastlyHttpResp for Sandbox {
     fn new(&mut self, _memory: &mut GuestMemory<'_>) -> Result<ResponseHandle, Error> {
         // KTM: Unfortunately `response::Parts` doesn't expose a constructor. This is a workaround.
         let (parts, _) = Response::new(()).into_parts();
@@ -104,7 +104,7 @@ impl FastlyHttpResp for Session {
         value: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.response_parts_mut(resp_handle)?.headers;
-        HttpHeaders::insert(headers, memory, name, value)
+        HttpHeadersWrite::insert(headers, memory, name, value)
     }
 
     fn header_append<'a>(
@@ -115,7 +115,7 @@ impl FastlyHttpResp for Session {
         value: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.response_parts_mut(resp_handle)?.headers;
-        HttpHeaders::append(headers, memory, name, value)
+        HttpHeadersWrite::append(headers, memory, name, value)
     }
 
     fn header_remove<'a>(
@@ -125,7 +125,7 @@ impl FastlyHttpResp for Session {
         name: GuestPtr<[u8]>,
     ) -> Result<(), Error> {
         let headers = &mut self.response_parts_mut(resp_handle)?.headers;
-        HttpHeaders::remove(headers, memory, name)
+        HttpHeadersWrite::remove(headers, memory, name)
     }
 
     fn version_get(
@@ -145,12 +145,12 @@ impl FastlyHttpResp for Session {
     ) -> Result<(), Error> {
         let resp = self.response_parts_mut(resp_handle)?;
 
-        let version = hyper::Version::try_from(version)?;
+        let version = hyper::Version::from(version);
         resp.version = version;
         Ok(())
     }
 
-    fn send_downstream(
+    async fn send_downstream(
         &mut self,
         _memory: &mut GuestMemory<'_>,
         resp_handle: ResponseHandle,
@@ -158,7 +158,7 @@ impl FastlyHttpResp for Session {
         streaming: u32,
     ) -> Result<(), Error> {
         let resp = {
-            // Take the response parts and body from the session, and use them to build a response.
+            // Take the response parts and body from the sandbox, and use them to build a response.
             // Return an `FastlyStatus::Badf` error code if either of the given handles are invalid.
             let resp_parts = self.take_response_parts(resp_handle)?;
             let body = if streaming == 1 {
@@ -168,7 +168,16 @@ impl FastlyHttpResp for Session {
             };
             Response::from_parts(resp_parts, body)
         }; // Set the downstream response, and return.
-        self.send_downstream_response(resp)
+        self.send_downstream_response(resp).await
+    }
+
+    async fn send_downstream_pending(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        h: PendingRequestHandle,
+    ) -> Result<(), Error> {
+        let pending = self.take_pending_request(h)?;
+        self.send_pending_response(pending).await
     }
 
     fn status_get(
