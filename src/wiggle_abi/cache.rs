@@ -677,7 +677,7 @@ impl FastlyCache for Session {
         // read into a crash. 0 is the honest "not counted" value and keeps lookups working.
         let entry = self.cache_entry_mut(handle).await?;
         if entry.found().is_some() {
-            Ok(0)
+            Ok(102)
         } else {
             Err(Error::CacheError(crate::cache::Error::Missing))
         }
