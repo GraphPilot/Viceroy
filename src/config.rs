@@ -56,7 +56,12 @@ pub use self::geolocation::Geolocation;
 /// Types and deserializers for object store configuration settings.
 mod object_store;
 
-pub use crate::object_store::ObjectStores;
+// The key types travel with the store: `ObjectStores` is public and its `insert`, `lookup`,
+// `delete` and `list` all take an `ObjectStoreKey` and an `ObjectKey`, so without these a host
+// embedding Viceroy can seed a KV store from a `fastly.toml` fragment but can never touch one
+// afterwards. Exported so a test harness can model what a control plane does to a KV store
+// between requests, e.g. revoking an entry the guest has already cached.
+pub use crate::object_store::{ObjectKey, ObjectStoreKey, ObjectStores};
 
 /// Types and deserializers for secret store configuration settings.
 mod secret_store;
