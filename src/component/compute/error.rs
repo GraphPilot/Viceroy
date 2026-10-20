@@ -15,6 +15,7 @@ use {
         status::InvalidStatusCode,
         uri::InvalidUri,
     },
+    std::{error::Error as StdError, io},
     wasmtime_wasi::ResourceTableError,
 };
 
@@ -173,6 +174,24 @@ impl From<KeyValidationError> for types::Error {
     }
 }
 
+impl From<KeyValidationError> for KvError {
+    fn from(_: KeyValidationError) -> Self {
+        KvError::BadRequest
+    }
+}
+
+impl From<ResourceTableError> for KvError {
+    fn from(_: ResourceTableError) -> Self {
+        KvError::InternalError
+    }
+}
+
+impl From<HandleError> for KvError {
+    fn from(_: HandleError) -> Self {
+        KvError::InternalError
+    }
+}
+
 impl From<SecretStoreError> for types::Error {
     fn from(err: SecretStoreError) -> Self {
         use SecretStoreError::*;
@@ -218,6 +237,16 @@ impl From<error::Error> for types::Error {
             Error::HyperError(e) if e.is_parse() => types::Error::HttpInvalid,
             Error::HyperError(e) if e.is_user() => types::Error::HttpUser,
             Error::HyperError(e) if e.is_incomplete_message() => types::Error::HttpIncomplete,
+            // A body that ends early does not satisfy `is_incomplete_message`. Hyper reports kind
+            // `Body`, with an `io::Error` cause of `UnexpectedEof`, so the cause needs a downcast.
+            Error::HyperError(e)
+                if e.source()
+                    .and_then(|e| e.downcast_ref::<io::Error>())
+                    .map(|ioe| ioe.kind())
+                    == Some(io::ErrorKind::UnexpectedEof) =>
+            {
+                types::Error::HttpIncomplete
+            }
             Error::HyperError(_) => types::Error::GenericError,
             // BackendConnectionError wraps hyper::Error with context
             Error::BackendConnectionError { source, .. } if source.is_parse() => {
@@ -227,6 +256,15 @@ impl From<error::Error> for types::Error {
                 types::Error::HttpUser
             }
             Error::BackendConnectionError { source, .. } if source.is_incomplete_message() => {
+                types::Error::HttpIncomplete
+            }
+            Error::BackendConnectionError { source, .. }
+                if source
+                    .source()
+                    .and_then(|e| e.downcast_ref::<io::Error>())
+                    .map(|ioe| ioe.kind())
+                    == Some(io::ErrorKind::UnexpectedEof) =>
+            {
                 types::Error::HttpIncomplete
             }
             Error::BackendConnectionError { .. } => types::Error::GenericError,

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{Level, Metadata, event};
 use tracing_subscriber::fmt::writer::MakeWriter;
-use viceroy_lib::{BackendConnector, ExecuteCtx, GuestProfileConfig, config::FastlyConfig};
+use viceroy_lib::{BackendConnector, ExecuteCtx, config::FastlyConfig};
 
 pub(crate) enum Stdio {
     Stdout(Stdout),
@@ -67,21 +67,21 @@ impl<'a> MakeWriter<'a> for StdWriter {
 pub(crate) async fn create_execution_context(
     args: &SharedArgs,
     check_backends: bool,
-    guest_profile_config: Option<GuestProfileConfig>,
 ) -> Result<Arc<ExecuteCtx>, anyhow::Error> {
     let input = args.input();
     let ctx = ExecuteCtx::build(
         input,
-        args.profiling_strategy(),
+        args.profiling_config(),
         args.wasi_modules(),
-        guest_profile_config,
         args.unknown_import_behavior(),
         args.adapt(),
         args.wasm_features(),
     )?
+    .with_debug_info(args.debug_info())
     .with_log_stderr(args.log_stderr())
     .with_log_stdout(args.log_stdout())
-    .with_local_pushpin_proxy_port(args.local_pushpin_proxy_port());
+    .with_local_pushpin_proxy_port(args.local_pushpin_proxy_port())
+    .with_enable_local_websocket_passthrough(args.enable_local_websocket_passthrough());
 
     let Some(config_path) = args.config_path() else {
         event!(

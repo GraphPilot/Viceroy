@@ -15,6 +15,7 @@ pub(crate) mod bindings {
             "fastly:compute/cache.[constructor]extra-lookup-options": tracing | trappable,
             "fastly:compute/cache.[constructor]extra-replace-options": tracing | trappable,
             "fastly:compute/cache.[constructor]extra-write-options": tracing | trappable,
+            "fastly:compute/http-req.[static]extra-cache-override-details.new": tracing | trappable,
 
             // The trap-test test depends on being able to induce an artificial
             // trap in `get-header-values`.
@@ -33,6 +34,7 @@ pub(crate) mod bindings {
             "fastly:compute/http-req.await-response": async | tracing,
             "fastly:compute/http-req.[method]request.redirect-to-grip-proxy": async | tracing,
             "fastly:compute/http-req.[method]request.redirect-to-websocket-proxy": async | tracing,
+            "fastly:compute/http-req.[method]extra-cache-override-details.set-lookup-timeout": tracing | trappable,
             "fastly:compute/http-resp.send-downstream": async | tracing,
             "fastly:compute/http-resp.send-downstream-streaming": async | tracing,
             "fastly:compute/http-resp.send-downstream-pending": async | tracing,
@@ -74,6 +76,7 @@ pub(crate) mod bindings {
             "fastly:compute/kv-store.[method]store.lookup-async": async | tracing,
             "fastly:compute/http-downstream.next-request": async | tracing,
             "fastly:compute/http-body.read": async | tracing,
+            "fastly:compute/backend.[method]backend.clone": tracing | trappable,
             "fastly:compute/backend.register-dynamic-backend": async | tracing,
             "fastly:compute/async-io.select": async | tracing | trappable,
             "fastly:compute/async-io.select-with-timeout": async | tracing,
@@ -88,6 +91,7 @@ pub(crate) mod bindings {
             "fastly:compute/cache.[static]entry.transaction-lookup-async": async | tracing,
             "fastly:compute/http-body.write": async | tracing,
             "fastly:compute/http-body.write-front": async | tracing,
+            "fastly:compute/log.[method]endpoint.clone": tracing | trappable,
 
             // Match the `wasmtime-wasi` crate's bindings.
             "wasi:io/streams.[method]output-stream.write": tracing | trappable,
@@ -99,12 +103,15 @@ pub(crate) mod bindings {
             "wasi:io/streams.[method]output-stream.blocking-write-zeroes-and-flush": async | tracing | trappable,
             "wasi:io/streams.[method]output-stream.splice": tracing | trappable,
             "wasi:io/streams.[method]output-stream.blocking-splice": async | tracing | trappable,
+            "wasi:io/streams.[drop]output-stream": async | tracing,
             "wasi:io/streams.[method]input-stream.read": tracing | trappable,
             "wasi:io/streams.[method]input-stream.blocking-read": async | tracing | trappable,
+            "wasi:io/streams.[drop]input-stream": async | tracing,
             "wasi:io/streams.[method]input-stream.skip": tracing | trappable,
             "wasi:io/streams.[method]input-stream.blocking-skip": async | tracing | trappable,
             "wasi:io/poll.poll": async | tracing,
             "wasi:io/poll.[method]pollable.block": async | tracing,
+            "wasi:io/poll.[method]pollable.ready": async | tracing,
             "wasi:cli/exit.exit": tracing | trappable,
             "wasi:cli/exit.exit-with-code": tracing | trappable,
         },
@@ -127,6 +134,7 @@ pub(crate) mod bindings {
             "fastly:compute/erl.penalty-box": String,
             "fastly:compute/http-downstream.extra-bot-category": super::compute::http_downstream::ExtraBotCategory,
             "fastly:compute/shielding.shield-backend-options": super::compute::shielding::ShieldBackendOptions,
+            "fastly:compute/http-req.extra-cache-override-details": crate::component::compute::http_req::ExtraCacheOverrideDetails,
         },
 
         trappable_error_type: {

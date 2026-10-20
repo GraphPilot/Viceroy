@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use viceroy_lib::{GuestProfileConfig, config::UnknownImportBehavior};
+use viceroy_lib::config::UnknownImportBehavior;
 
 use {
     clap::{Args, Parser, Subcommand, ValueEnum},
@@ -12,7 +12,7 @@ use {
         net::SocketAddr,
         path::{Path, PathBuf},
     },
-    viceroy_lib::{Error, ProfilingStrategy, config::ExperimentalModule},
+    viceroy_lib::{Error, ProfilingConfig, ProfilingStrategy, config::ExperimentalModule},
     wasmtime::WasmFeatures,
 };
 
@@ -107,6 +107,23 @@ pub struct SharedArgs {
     /// is disabled.
     #[arg(long = "local-pushpin-proxy-port")]
     local_pushpin_proxy_port: Option<u16>,
+    /// Whether WebSocket passthrough is enabled for the service.
+    ///
+    /// Set this to `false` to simulate a service that does not have the WebSockets
+    /// feature enabled: `redirect_to_websocket_proxy` will report `unsupported` to
+    /// the guest, so that it can exercise its handling of that state locally.
+    #[arg(
+        long = "enable-local-websocket-passthrough",
+        value_name = "BOOL",
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        // `require_equals` keeps the bare form from swallowing the following positional
+        // argument as its value.
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+    )]
+    enable_local_websocket_passthrough: bool,
     /// Set of experimental WASI modules to link against.
     #[arg(value_enum, long = "experimental_modules", required = false)]
     experimental_modules: Vec<ExperimentalModuleArg>,
@@ -125,6 +142,13 @@ pub struct SharedArgs {
     /// components before running them.
     #[arg(long = "adapt")]
     adapt: bool,
+    /// Generate native debug information for the guest, so that it can be inspected with a
+    /// native debugger such as `lldb` or `gdb`.
+    ///
+    /// This requires the guest to have been built with debug information of its own, and makes
+    /// compilation slower.
+    #[arg(short = 'g', long = "debug-info")]
+    debug_info: bool,
     /// Enable the Wasm Exception Handling feature.
     #[arg(long)]
     wasm_exceptions: bool,
@@ -189,11 +213,22 @@ impl SharedArgs {
         self.log_stderr
     }
 
-    /// Whether to enable wasmtime's builtin profiler.
-    pub fn profiling_strategy(&self) -> ProfilingStrategy {
-        match self.profile {
-            Some(Profile::Native(s)) => s,
-            _ => ProfilingStrategy::None,
+    /// Get the unified profiling configuration
+    pub fn profiling_config(&self) -> ProfilingConfig {
+        match &self.profile {
+            Some(Profile::Native(strategy)) => ProfilingConfig::Native(*strategy),
+            Some(Profile::Guest {
+                path,
+                sample_period,
+            }) => ProfilingConfig::Guest {
+                path: PathBuf::from(
+                    path.as_ref()
+                        .map(|p| p.as_str())
+                        .unwrap_or("guest-profiles"),
+                ),
+                sample_period: sample_period.unwrap_or(Duration::from_micros(50)),
+            },
+            None => ProfilingConfig::None,
         }
     }
 
@@ -202,24 +237,9 @@ impl SharedArgs {
         self.local_pushpin_proxy_port
     }
 
-    /// Configuration for guest profiling if enabled
-    pub fn guest_profile_config(&self) -> Option<GuestProfileConfig> {
-        if let Some(Profile::Guest {
-            path,
-            sample_period,
-        }) = &self.profile
-        {
-            Some(GuestProfileConfig {
-                path: PathBuf::from(
-                    path.as_ref()
-                        .map(|p| p.as_str())
-                        .unwrap_or("guest-profiles"),
-                ),
-                sample_period: sample_period.unwrap_or_else(|| Duration::from_micros(50)),
-            })
-        } else {
-            None
-        }
+    /// Whether WebSocket passthrough is enabled for the service.
+    pub fn enable_local_websocket_passthrough(&self) -> bool {
+        self.enable_local_websocket_passthrough
     }
 
     /// Set of experimental wasi modules to link against.
@@ -241,6 +261,11 @@ impl SharedArgs {
 
     pub fn adapt(&self) -> bool {
         self.adapt
+    }
+
+    /// Whether to generate native debug information for the guest.
+    pub fn debug_info(&self) -> bool {
+        self.debug_info
     }
 
     pub fn wasm_features(&self) -> WasmFeatures {

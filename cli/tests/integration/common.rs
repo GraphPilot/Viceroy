@@ -15,7 +15,7 @@ use std::{
 use tracing_subscriber::filter::EnvFilter;
 use viceroy_lib::config::UnknownImportBehavior;
 use viceroy_lib::{
-    ExecuteCtx, ProfilingStrategy, ViceroyService,
+    ExecuteCtx, ProfilingConfig, ViceroyService,
     body::Body,
     config::{
         Acls, DeviceDetection, Dictionaries, FakeValidFastlyKeys, FastlyConfig, Geolocation,
@@ -59,7 +59,13 @@ macro_rules! viceroy_test {
 /// ```
 /// let module_path = format!("{}/guest.wasm", RUST_FIXTURE_PATH);
 /// ```
-pub static RUST_FIXTURE_PATH: &str = "../test-fixtures/target/wasm32-wasip1/debug/";
+///
+/// Anchored on `CARGO_MANIFEST_DIR` so it resolves regardless of the process's current
+/// working directory, e.g. when launched directly by an editor/debugger.
+pub static RUST_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../test-fixtures/target/wasm32-wasip1/debug/"
+);
 
 /// A shorthand for the path to our test fixtures' build artifacts for WAT tests.
 ///
@@ -69,7 +75,10 @@ pub static RUST_FIXTURE_PATH: &str = "../test-fixtures/target/wasm32-wasip1/debu
 /// ```
 /// let module_path = format!("{}/guest.wat", WAT_FIXTURE_PATH);
 /// ```
-pub static WAT_FIXTURE_PATH: &str = "../test-fixtures/";
+///
+/// Anchored on `CARGO_MANIFEST_DIR` so it resolves regardless of the process's current
+/// working directory, e.g. when launched directly by an editor/debugger.
+pub static WAT_FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-fixtures/");
 
 /// A catch-all error, so we can easily use `?` in test cases.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -95,8 +104,9 @@ pub struct Test {
     via_hyper: bool,
     unknown_import_behavior: UnknownImportBehavior,
     adapt_component: bool,
-    profiling_strategy: ProfilingStrategy,
-    guest_profile_config: Option<viceroy_lib::GuestProfileConfig>,
+    enable_local_websocket_passthrough: bool,
+    profiling: ProfilingConfig,
+    debug_info: bool,
 }
 
 impl Test {
@@ -122,8 +132,9 @@ impl Test {
             via_hyper: false,
             unknown_import_behavior: Default::default(),
             adapt_component: false,
-            profiling_strategy: ProfilingStrategy::None,
-            guest_profile_config: None,
+            enable_local_websocket_passthrough: true,
+            profiling: ProfilingConfig::None,
+            debug_info: false,
         }
     }
 
@@ -149,8 +160,9 @@ impl Test {
             via_hyper: false,
             unknown_import_behavior: Default::default(),
             adapt_component: false,
-            profiling_strategy: ProfilingStrategy::None,
-            guest_profile_config: None,
+            enable_local_websocket_passthrough: true,
+            profiling: ProfilingConfig::None,
+            debug_info: false,
         }
     }
 
@@ -346,9 +358,21 @@ impl Test {
         self
     }
 
-    /// Enable guest profiling with the specified configuration.
-    pub fn with_guest_profiling(mut self, config: viceroy_lib::GuestProfileConfig) -> Self {
-        self.guest_profile_config = Some(config);
+    /// Set whether WebSocket passthrough is enabled for this test.
+    pub fn enable_local_websocket_passthrough(mut self, enable: bool) -> Self {
+        self.enable_local_websocket_passthrough = enable;
+        self
+    }
+
+    /// Set the profiling configuration for this test.
+    pub fn with_profiling(mut self, profiling: ProfilingConfig) -> Self {
+        self.profiling = profiling;
+        self
+    }
+
+    /// Compile the guest with native debug information.
+    pub fn debug_info(mut self, debug_info: bool) -> Self {
+        self.debug_info = debug_info;
         self
     }
 
@@ -396,13 +420,13 @@ impl Test {
 
         let ctx = ExecuteCtx::build(
             &self.module_path,
-            self.profiling_strategy,
+            self.profiling.clone(),
             HashSet::new(),
-            self.guest_profile_config.clone(),
             self.unknown_import_behavior,
             self.adapt_component,
             WasmFeatures::default(),
         )?
+        .with_debug_info(self.debug_info)
         .with_acls(self.acls.clone())
         .with_backends(self.backends.backend_configs().await)
         .with_dictionaries(self.dictionaries.clone())
@@ -412,6 +436,7 @@ impl Test {
         .with_secret_stores(self.secret_stores.clone())
         .with_shielding_sites(self.shielding_sites.clone())
         .with_fake_valid_fastly_keys(self.fake_valid_fastly_keys.clone())
+        .with_enable_local_websocket_passthrough(self.enable_local_websocket_passthrough)
         .with_capture_logs(self.capture_logs.clone())
         .with_log_stderr(self.log_stderr)
         .with_log_stdout(self.log_stdout)

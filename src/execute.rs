@@ -48,7 +48,7 @@ use {
     tokio::sync::Mutex as AsyncMutex,
     tokio::sync::mpsc,
     tokio::sync::oneshot::{self, Sender},
-    tracing::{Instrument, Level, error, event, info, info_span, warn},
+    tracing::{Instrument, Level, error, event, info, info_span},
     wasmtime::{
         Engine, GuestProfiler, InstancePre, Linker, Module, ProfilingStrategy,
         component::{self, Component},
@@ -80,14 +80,56 @@ impl Instance {
     }
 }
 
+/// Configuration for profiling Wasm execution.
+///
+/// Viceroy supports two types of profiling:
+/// - **Guest profiling**: Profiles the WebAssembly guest code itself, producing Firefox profiler compatible JSON.
+/// - **Native profiling**: Profiles wasmtime's JIT compiler for debugging across guest, viceroy and wasmtime.
 #[derive(Clone)]
-pub struct GuestProfileConfig {
-    /// Path to write profiling results from the guest. In serve mode,
-    /// this must refer to a directory, while in run mode it names
-    /// a file.
-    pub path: PathBuf,
-    /// Period at which the guest should be profiled.
-    pub sample_period: Duration,
+pub enum ProfilingConfig {
+    /// No profiling enabled
+    None,
+    /// Profile the WebAssembly guest code
+    Guest {
+        /// Path to write profiling results. In serve mode, this should be a directory
+        /// where per-request profiles are written. In run mode, this is a single file.
+        path: PathBuf,
+        /// Period at which the guest should be sampled (default: 50μs)
+        sample_period: Duration,
+    },
+    /// Profile wasmtime's JIT compiler using native profiling tools
+    Native(wasmtime::ProfilingStrategy),
+}
+
+impl ProfilingConfig {
+    /// Get the native profiling strategy for wasmtime
+    pub fn native_strategy(&self) -> wasmtime::ProfilingStrategy {
+        match self {
+            ProfilingConfig::Native(strategy) => *strategy,
+            _ => wasmtime::ProfilingStrategy::None,
+        }
+    }
+
+    /// Get the guest profile configuration if guest profiling is enabled
+    fn guest_config(&self) -> Option<GuestProfileConfig> {
+        match self {
+            ProfilingConfig::Guest {
+                path,
+                sample_period,
+            } => Some(GuestProfileConfig {
+                path: path.clone(),
+                sample_period: *sample_period,
+            }),
+            _ => None,
+        }
+    }
+}
+
+// Keep GuestProfileConfig internal for now to maintain backwards compatibility
+#[derive(Clone)]
+struct GuestProfileConfig {
+    path: PathBuf,
+    sample_period: Duration,
 }
 
 pub struct NextRequest(Option<(Box<DownstreamRequest>, Arc<ExecuteCtx>)>);
@@ -127,6 +169,29 @@ pub struct ExecuteCtx {
     engine: Engine,
     /// An almost-linked Instance: each import function is linked, just needs a Store
     instance_pre: Arc<Instance>,
+    /// Preloaded TLS certificates and configuration
+    tls_config: TlsConfig,
+    /// The ID to assign the next incoming request
+    next_req_id: Arc<AtomicU64>,
+    /// The cache for this service.
+    cache: Arc<Cache>,
+    /// Senders waiting for new requests for reusable sandboxes.
+    pending_reuse: Arc<AsyncMutex<Vec<Sender<NextRequest>>>>,
+    epoch_increment_thread: Option<JoinHandle<()>>,
+    // `Arc` so that it can be tracked both by this context and `epoch_increment_thread`.
+    epoch_increment_stop: Arc<AtomicBool>,
+    /// Configuration for guest profiling if enabled
+    guest_profile_config: Option<Arc<GuestProfileConfig>>,
+    /// The settings supplied through [`ExecuteCtxBuilder`].
+    settings: Settings,
+}
+
+/// The parts of an [`ExecuteCtx`] that can be configured through [`ExecuteCtxBuilder`].
+///
+/// These are held separately from the rest of the context so that the builder can collect them
+/// before the Wasm engine has been created: building the engine is deferred to
+/// [`ExecuteCtxBuilder::finish`], so that engine-affecting settings can be adjusted first.
+struct Settings {
     /// The acls for this execution.
     acls: Acls,
     /// The backends for this execution.
@@ -135,8 +200,6 @@ pub struct ExecuteCtx {
     device_detection: DeviceDetection,
     /// The geolocation mappings for this execution.
     geolocation: Geolocation,
-    /// Preloaded TLS certificates and configuration
-    tls_config: TlsConfig,
     /// The dictionaries for this execution.
     dictionaries: Dictionaries,
     /// Path to the config, defaults to None
@@ -149,8 +212,11 @@ pub struct ExecuteCtx {
     log_stderr: bool,
     /// The local Pushpin proxy port
     local_pushpin_proxy_port: Option<u16>,
-    /// The ID to assign the next incoming request
-    next_req_id: Arc<AtomicU64>,
+    /// Whether WebSocket passthrough is enabled for this service.
+    ///
+    /// Set this to `false` to simulate a service that does not have the WebSockets feature
+    /// enabled, so that guests can exercise their handling of that state locally.
+    enable_local_websocket_passthrough: bool,
     /// The ObjectStore associated with this instance of Viceroy
     object_store: ObjectStores,
     /// The secret stores for this execution.
@@ -159,187 +225,71 @@ pub struct ExecuteCtx {
     shielding_sites: ShieldingSites,
     /// The valid mock Fastly API keys that should be considered valid.
     fake_valid_fastly_keys: FakeValidFastlyKeys,
-    /// The cache for this service.
-    cache: Arc<Cache>,
-    /// Senders waiting for new requests for reusable sandboxes.
-    pending_reuse: Arc<AsyncMutex<Vec<Sender<NextRequest>>>>,
-    epoch_increment_thread: Option<JoinHandle<()>>,
-    // `Arc` so that it can be tracked both by this context and `epoch_increment_thread`.
-    epoch_increment_stop: Arc<AtomicBool>,
-    /// Configuration for guest profiling if enabled
-    guest_profile_config: Option<Arc<GuestProfileConfig>>,
 }
 
-impl ExecuteCtx {
-    /// Build a new execution context, given the path to a module and a set of experimental wasi modules.
-    pub fn build(
-        module_path: impl AsRef<Path>,
-        profiling_strategy: ProfilingStrategy,
-        wasi_modules: HashSet<ExperimentalModule>,
-        guest_profile_config: Option<GuestProfileConfig>,
-        unknown_import_behavior: UnknownImportBehavior,
-        adapt_components: bool,
-        wasm_features: WasmFeatures,
-    ) -> Result<ExecuteCtxBuilder, Error> {
-        let input = fs::read(&module_path)?;
-
-        let is_wat = module_path
-            .as_ref()
-            .extension()
-            .map(|str| str == "wat")
-            .unwrap_or(false);
-
-        // When the input wasn't a component, but we're automatically adapting,
-        // apply the component adapter.
-        let is_component = adapt::is_component(&input);
-        let (is_wat, is_component, input) = if !is_component && adapt_components {
-            let input = if is_wat {
-                let text = String::from_utf8(input).map_err(|_| {
-                    anyhow::anyhow!("Failed to parse {}", module_path.as_ref().display())
-                })?;
-                adapt::adapt_wat(&text)?
-            } else {
-                adapt::adapt_bytes(&input)?
-            };
-
-            (false, true, input)
-        } else {
-            (is_wat, is_component, input)
-        };
-
-        let config = &configure_wasmtime(wasm_features, profiling_strategy);
-        let engine = Engine::new(config)?;
-        let instance_pre = if is_component {
-            warn!(
-                "
-
-   +------------------------------------------------------------------------+
-   |                                                                        |
-   | Wasm Component support in viceroy is in active development, and is not |
-   |                    supported for general consumption.                  |
-   |                                                                        |
-   +------------------------------------------------------------------------+
-
-            "
-            );
-
-            // If logging isn't enabled, print the notice to stderr.
-            if !tracing::enabled!(Level::WARN) {
-                eprintln!(
-                    "
-
-   +------------------------------------------------------------------------+
-   |                                                                        |
-   | Wasm Component support in viceroy is in active development, and is not |
-   |                    supported for general consumption.                  |
-   |                                                                        |
-   +------------------------------------------------------------------------+
-
-            "
-                );
-            }
-
-            let mut linker: component::Linker<ComponentCtx> = component::Linker::new(&engine);
-            compute::link_host_functions(&mut linker)?;
-            let component = if is_wat {
-                Component::from_file(&engine, &module_path)?
-            } else {
-                Component::from_binary(&engine, &input)?
-            };
-
-            match unknown_import_behavior {
-                UnknownImportBehavior::LinkError => (),
-                UnknownImportBehavior::Trap => {
-                    linker.define_unknown_imports_as_traps(&component)?
-                }
-            }
-
-            let instance_pre = linker.instantiate_pre(&component)?;
-            Instance::Component(
-                component,
-                compute::bindings::AdapterServicePre::new(instance_pre)?,
-            )
-        } else {
-            let mut linker = Linker::new(&engine);
-            link_host_functions(&mut linker, &wasi_modules)?;
-            let module = if is_wat {
-                Module::from_file(&engine, &module_path)?
-            } else {
-                Module::from_binary(&engine, &input)?
-            };
-
-            match unknown_import_behavior {
-                UnknownImportBehavior::LinkError => (),
-                UnknownImportBehavior::Trap => linker.define_unknown_imports_as_traps(&module)?,
-            }
-
-            let instance_pre = linker.instantiate_pre(&module)?;
-            Instance::Module(module, instance_pre)
-        };
-
-        // Create the epoch-increment thread. Note that the period for epoch
-        // interruptions is driven by the guest profiling sample period if
-        // provided as guest stack sampling is done from the epoch
-        // interruption callback.
-
-        let epoch_increment_stop = Arc::new(AtomicBool::new(false));
-        let engine_clone = engine.clone();
-        let epoch_increment_stop_clone = epoch_increment_stop.clone();
-        let sample_period = guest_profile_config
-            .as_ref()
-            .map(|c| c.sample_period)
-            .unwrap_or(DEFAULT_EPOCH_INTERRUPTION_PERIOD);
-        let epoch_increment_thread = Some(thread::spawn(move || {
-            while !epoch_increment_stop_clone.load(Ordering::Relaxed) {
-                thread::sleep(sample_period);
-                engine_clone.increment_epoch();
-            }
-        }));
-
-        let inner = Self {
-            engine,
-            instance_pre: Arc::new(instance_pre),
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
             acls: Acls::new(),
             backends: Backends::default(),
             device_detection: DeviceDetection::default(),
             geolocation: Geolocation::default(),
-            tls_config: TlsConfig::new()?,
             dictionaries: Dictionaries::default(),
             config_path: None,
             capture_logs: Arc::new(Mutex::new(std::io::stdout())),
             log_stdout: false,
             log_stderr: false,
             local_pushpin_proxy_port: None,
-            next_req_id: Arc::new(AtomicU64::new(0)),
+            enable_local_websocket_passthrough: true,
             object_store: ObjectStores::new(),
             secret_stores: SecretStores::new(),
             shielding_sites: ShieldingSites::new(),
             fake_valid_fastly_keys: FakeValidFastlyKeys::new(),
-            epoch_increment_thread,
-            epoch_increment_stop,
-            guest_profile_config: guest_profile_config.map(Arc::new),
-            cache: Arc::new(Cache::default()),
-            pending_reuse: Arc::new(AsyncMutex::new(vec![])),
-        };
+        }
+    }
+}
 
-        Ok(ExecuteCtxBuilder { inner })
+impl ExecuteCtx {
+    /// Build a new execution context with unified profiling configuration.
+    ///
+    /// Note that the module is not read, compiled, or linked until
+    /// [`ExecuteCtxBuilder::finish`] is called, so errors relating to the module itself are
+    /// reported from there rather than here.
+    pub fn build(
+        module_path: impl AsRef<Path>,
+        profiling: ProfilingConfig,
+        wasi_modules: HashSet<ExperimentalModule>,
+        unknown_import_behavior: UnknownImportBehavior,
+        adapt_components: bool,
+        wasm_features: WasmFeatures,
+    ) -> Result<ExecuteCtxBuilder, Error> {
+        Ok(ExecuteCtxBuilder {
+            module_path: module_path.as_ref().to_owned(),
+            profiling,
+            wasi_modules,
+            unknown_import_behavior,
+            adapt_components,
+            wasm_features,
+            debug_info: false,
+            settings: Settings::default(),
+        })
     }
 
-    /// Create a new execution context, given the path to a module and a set of experimental wasi modules.
+    /// Create a new execution context with unified profiling configuration.
+    ///
+    /// This is a convenience wrapper around `build().finish()`.
     pub fn new(
         module_path: impl AsRef<Path>,
-        profiling_strategy: ProfilingStrategy,
+        profiling: ProfilingConfig,
         wasi_modules: HashSet<ExperimentalModule>,
-        guest_profile_config: Option<GuestProfileConfig>,
         unknown_import_behavior: UnknownImportBehavior,
         adapt_components: bool,
         wasm_features: WasmFeatures,
     ) -> Result<Arc<Self>, Error> {
         ExecuteCtx::build(
             module_path,
-            profiling_strategy,
+            profiling,
             wasi_modules,
-            guest_profile_config,
             unknown_import_behavior,
             adapt_components,
             wasm_features,
@@ -354,42 +304,42 @@ impl ExecuteCtx {
 
     /// Get the acls for this execution context.
     pub fn acls(&self) -> &Acls {
-        &self.acls
+        &self.settings.acls
     }
 
     /// Get the backends for this execution context.
     pub fn backends(&self) -> &Backends {
-        &self.backends
+        &self.settings.backends
     }
 
     /// Get the device detection mappings for this execution context.
     pub fn device_detection(&self) -> &DeviceDetection {
-        &self.device_detection
+        &self.settings.device_detection
     }
 
     /// Get the geolocation mappings for this execution context.
     pub fn geolocation(&self) -> &Geolocation {
-        &self.geolocation
+        &self.settings.geolocation
     }
 
     /// Get the dictionaries for this execution context.
     pub fn dictionaries(&self) -> &Dictionaries {
-        &self.dictionaries
+        &self.settings.dictionaries
     }
 
     /// Where to direct logging endpoint messages. Defaults to stdout.
     pub fn capture_logs(&self) -> Arc<Mutex<dyn Write + Send>> {
-        self.capture_logs.clone()
+        self.settings.capture_logs.clone()
     }
 
     /// Whether to treat stdout as a logging endpoint.
     pub fn log_stdout(&self) -> bool {
-        self.log_stdout
+        self.settings.log_stdout
     }
 
     /// Whether to treat stderr as a logging endpoint.
     pub fn log_stderr(&self) -> bool {
-        self.log_stderr
+        self.settings.log_stderr
     }
 
     /// Gets the TLS configuration
@@ -399,7 +349,7 @@ impl ExecuteCtx {
 
     async fn maybe_receive_response(
         mut receiver: mpsc::Receiver<DownstreamResponse>,
-    ) -> Option<(Response<Body>, Option<anyhow::Error>)> {
+    ) -> Option<(Response<Body>, Option<wasmtime::Error>)> {
         loop {
             match receiver.recv().await? {
                 DownstreamResponse::Http(mut resp) => {
@@ -426,8 +376,8 @@ impl ExecuteCtx {
                     let mut resp = pending
                         .recv_or_else(|e| {
                             let status = e.as_status_code();
-                            let err = anyhow::Error::from(e);
-                            anyhow_response_with_status(&err, status)
+                            let err = wasmtime::Error::from(e);
+                            err_response_with_status(&err, status)
                         })
                         .await;
 
@@ -466,19 +416,19 @@ impl ExecuteCtx {
     /// # use std::collections::HashSet;
     /// # use wasmtime::WasmFeatures;
     /// use hyper::{Body, http::Request};
-    /// # use viceroy_lib::{Error, ExecuteCtx, ProfilingStrategy, ViceroyService};
+    /// # use viceroy_lib::{Error, ExecuteCtx, ProfilingConfig, ViceroyService};
+    /// # use viceroy_lib::config::UnknownImportBehavior;
     /// # async fn f() -> Result<(), Error> {
     /// # let req = Request::new(Body::from(""));
     /// let adapt_core_wasm = false;
     /// let wasm_features = WasmFeatures::default();
     /// let ctx = ExecuteCtx::new(
     ///     "path/to/a/file.wasm",
-    ///     ProfilingStrategy::None,
+    ///     ProfilingConfig::None,
     ///     HashSet::new(),
-    ///     None,
-    ///     Default::default(),
+    ///     UnknownImportBehavior::LinkError,
     ///     adapt_core_wasm,
-    ///     wasm_features
+    ///     wasm_features,
     /// )?;
     /// let local = "127.0.0.1:80".parse().unwrap();
     /// let remote = "127.0.0.1:0".parse().unwrap();
@@ -491,10 +441,10 @@ impl ExecuteCtx {
         mut incoming_req: Request<hyper::Body>,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Result<(Response<Body>, Option<anyhow::Error>), Error> {
+    ) -> Result<(Response<Body>, Option<wasmtime::Error>), Error> {
         let orig_req_on_upgrade = hyper::upgrade::on(&mut incoming_req);
         let (incoming_req_parts, incoming_req_body) = incoming_req.into_parts();
-        let local_pushpin_proxy_port = self.local_pushpin_proxy_port;
+        let local_pushpin_proxy_port = self.settings.local_pushpin_proxy_port;
 
         let (body_for_wasm, orig_body_tee) = tee(incoming_req_body).await;
         let orig_request_info_for_pushpin = HandoffRequestInfo::from_parts(&incoming_req_parts);
@@ -514,7 +464,7 @@ impl ExecuteCtx {
             original_headers,
         };
 
-        let backends = self.backends.clone();
+        let backends = self.settings.backends.clone();
         let tls_config = self.tls_config.clone();
 
         let (resp, mut err) = self.reuse_or_spawn_guest(req, metadata).await;
@@ -531,6 +481,9 @@ impl ExecuteCtx {
 
                     info!("Pushpin handoff signaled to backend '{backend_name}'");
 
+                    // Defensive only: `Sandbox::redirect_downstream_to_pushpin` is the sole
+                    // producer of this handoff, and it now rejects the call with an
+                    // `unsupported` error before signaling when no proxy port is configured.
                     let local_pushpin_proxy_port = match local_pushpin_proxy_port {
                         None => {
                             error!("Pushpin handoff signaled, but Pushpin mode not enabled.");
@@ -692,7 +645,7 @@ impl ExecuteCtx {
         self: Arc<Self>,
         req: Request<Body>,
         metadata: DownstreamMetadata,
-    ) -> (Response<Body>, Option<anyhow::Error>) {
+    ) -> (Response<Body>, Option<wasmtime::Error>) {
         let (downstream, receiver) = DownstreamRequest::new(req, metadata);
 
         let mut next_req = NextRequest(Some((Box::new(downstream), self.clone())));
@@ -725,7 +678,7 @@ impl ExecuteCtx {
         self: Arc<Self>,
         downstream: DownstreamRequest,
         receiver: mpsc::Receiver<DownstreamResponse>,
-    ) -> (Response<Body>, Option<anyhow::Error>) {
+    ) -> (Response<Body>, Option<wasmtime::Error>) {
         let active_cpu_time_us = Arc::new(AtomicU64::new(0));
 
         // Spawn a separate task to run the guest code. That allows _this_ method to return a response early
@@ -752,7 +705,7 @@ impl ExecuteCtx {
                     "There was an error handling the request {}",
                     e.to_string()
                 );
-                (anyhow_response(&e), Some(e))
+                (err_response(&e), Some(e))
             }
             Err(e) => panic!("failed to run guest: {}", e),
         }
@@ -782,15 +735,21 @@ impl ExecuteCtx {
 
         match self.instance_pre.as_ref() {
             Instance::Component(component, instance_pre) => {
-                let profiler = self.guest_profile_config.as_deref().map(|pcfg| {
-                    let program_name = "main";
-                    GuestProfiler::new_component(
-                        program_name,
-                        pcfg.sample_period,
-                        component.clone(),
-                        std::iter::empty(),
-                    )
-                });
+                let profiler = self
+                    .guest_profile_config
+                    .as_deref()
+                    .map(|pcfg| {
+                        let program_name = "main";
+                        GuestProfiler::new_component(
+                            &self.engine,
+                            program_name,
+                            pcfg.sample_period,
+                            component.clone(),
+                            std::iter::empty(),
+                        )
+                    })
+                    .transpose()
+                    .map_err(ExecutionError::Context)?;
 
                 let req = sandbox.downstream_request();
                 let body = sandbox.downstream_request_body();
@@ -815,7 +774,7 @@ impl ExecuteCtx {
 
                     Ok(Err(())) => {
                         event!(Level::ERROR, "WebAssembly exited with an error");
-                        Err(ExecutionError::WasmTrap(anyhow::Error::msg("failed")))
+                        Err(ExecutionError::WasmTrap(wasmtime::format_err!("failed")))
                     }
 
                     Err(e) => {
@@ -852,7 +811,7 @@ impl ExecuteCtx {
 
                 info!(
                     "guest completed using {} of WebAssembly heap",
-                    bytesize::ByteSize::b(store.data().limiter().memory_allocated as u64),
+                    ByteFormatter(store.data().limiter().memory_allocated),
                 );
 
                 info!("guest completed in {:.0?}", request_duration);
@@ -861,14 +820,20 @@ impl ExecuteCtx {
             }
 
             Instance::Module(module, instance_pre) => {
-                let profiler = self.guest_profile_config.as_deref().map(|pcfg| {
-                    let program_name = "main";
-                    GuestProfiler::new(
-                        program_name,
-                        pcfg.sample_period,
-                        vec![(program_name.to_string(), module.clone())],
-                    )
-                });
+                let profiler = self
+                    .guest_profile_config
+                    .as_deref()
+                    .map(|pcfg| {
+                        let program_name = "main";
+                        GuestProfiler::new(
+                            &self.engine,
+                            program_name,
+                            pcfg.sample_period,
+                            vec![(program_name.to_string(), module.clone())],
+                        )
+                    })
+                    .transpose()
+                    .map_err(ExecutionError::Context)?;
 
                 // We currently have to postpone linking and instantiation to the guest task
                 // due to wasmtime limitations, in particular the fact that `Instance` is not `Send`.
@@ -924,7 +889,7 @@ impl ExecuteCtx {
 
                 info!(
                     "request completed using {} of WebAssembly heap",
-                    bytesize::ByteSize::b(store.data().limiter().memory_allocated as u64)
+                    ByteFormatter(store.data().limiter().memory_allocated)
                 );
 
                 info!("request completed in {:.0?}", request_duration);
@@ -959,13 +924,19 @@ impl ExecuteCtx {
 
         let (module, instance_pre) = self.instance_pre.unwrap_module();
 
-        let profiler = self.guest_profile_config.as_deref().map(|pcfg| {
-            GuestProfiler::new(
-                program_name,
-                pcfg.sample_period,
-                vec![(program_name.to_string(), module.clone())],
-            )
-        });
+        let profiler = self
+            .guest_profile_config
+            .as_deref()
+            .map(|pcfg| {
+                GuestProfiler::new(
+                    &self.engine,
+                    program_name,
+                    pcfg.sample_period,
+                    vec![(program_name.to_string(), module.clone())],
+                )
+            })
+            .transpose()
+            .map_err(ExecutionError::Context)?;
 
         let mut store = create_store(&self, sandbox, profiler, |builder| {
             builder.arg(program_name);
@@ -1007,7 +978,7 @@ impl ExecuteCtx {
         // finished.
         drop(receiver);
 
-        result
+        Ok(result?)
     }
 
     pub fn cache(&self) -> &Arc<Cache> {
@@ -1015,24 +986,34 @@ impl ExecuteCtx {
     }
 
     pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
+        self.settings.config_path.as_deref()
     }
 
     pub fn object_store(&self) -> &ObjectStores {
-        &self.object_store
+        &self.settings.object_store
     }
 
     pub fn secret_stores(&self) -> &SecretStores {
-        &self.secret_stores
+        &self.settings.secret_stores
     }
 
     pub fn shielding_sites(&self) -> &ShieldingSites {
-        &self.shielding_sites
+        &self.settings.shielding_sites
+    }
+
+    /// The local Pushpin proxy port, if Fanout is enabled for this execution context.
+    pub fn local_pushpin_proxy_port(&self) -> Option<u16> {
+        self.settings.local_pushpin_proxy_port
+    }
+
+    /// Whether WebSocket passthrough is enabled for this execution context.
+    pub fn enable_local_websocket_passthrough(&self) -> bool {
+        self.settings.enable_local_websocket_passthrough
     }
 
     /// Get the valid mock Fastly API keys for this execution context.
     pub fn fake_valid_fastly_keys(&self) -> &FakeValidFastlyKeys {
-        &self.fake_valid_fastly_keys
+        &self.settings.fake_valid_fastly_keys
     }
 
     pub async fn register_pending_downstream(&self) -> Option<oneshot::Receiver<NextRequest>> {
@@ -1054,58 +1035,201 @@ impl ExecuteCtx {
 }
 
 pub struct ExecuteCtxBuilder {
-    inner: ExecuteCtx,
+    /// Path to the module to run.
+    module_path: PathBuf,
+    /// How execution of this module should be profiled, if at all.
+    profiling: ProfilingConfig,
+    /// The experimental wasi modules to link against.
+    wasi_modules: HashSet<ExperimentalModule>,
+    /// What to do with imports the host does not provide.
+    unknown_import_behavior: UnknownImportBehavior,
+    /// Whether to adapt core wasm modules to components before running them.
+    adapt_components: bool,
+    /// The wasm proposals to enable.
+    wasm_features: WasmFeatures,
+    /// Whether to compile the guest with native debug info, so that it can be inspected with a
+    /// native debugger.
+    debug_info: bool,
+    /// The settings to hand to the finished context.
+    settings: Settings,
 }
 
 impl ExecuteCtxBuilder {
+    /// Read, compile, and link the module, producing an execution context ready to serve
+    /// requests.
     pub fn finish(self) -> Result<Arc<ExecuteCtx>, Error> {
-        Ok(Arc::new(self.inner))
+        let ExecuteCtxBuilder {
+            module_path,
+            profiling,
+            wasi_modules,
+            unknown_import_behavior,
+            adapt_components,
+            wasm_features,
+            debug_info,
+            settings,
+        } = self;
+
+        let guest_profile_config = profiling.guest_config();
+
+        let input = fs::read(&module_path)?;
+
+        let is_wat = module_path
+            .extension()
+            .map(|str| str == "wat")
+            .unwrap_or(false);
+
+        // When the input wasn't a component, but we're automatically adapting,
+        // apply the component adapter.
+        let is_component = adapt::is_component(&input);
+        let (is_wat, is_component, input) = if !is_component && adapt_components {
+            let input = if is_wat {
+                let text = String::from_utf8(input)
+                    .map_err(|_| anyhow::anyhow!("Failed to parse {}", module_path.display()))?;
+                adapt::adapt_wat(&text)?
+            } else {
+                adapt::adapt_bytes(&input)?
+            };
+
+            (false, true, input)
+        } else {
+            (is_wat, is_component, input)
+        };
+
+        let config = &configure_wasmtime(wasm_features, profiling.native_strategy(), debug_info);
+        let engine = Engine::new(config).map_err(anyhow::Error::from)?;
+        let instance_pre = if is_component {
+            let mut linker: component::Linker<ComponentCtx> = component::Linker::new(&engine);
+            compute::link_host_functions(&mut linker)?;
+            let component = if is_wat {
+                Component::from_file(&engine, &module_path).map_err(anyhow::Error::from)?
+            } else {
+                Component::from_binary(&engine, &input).map_err(anyhow::Error::from)?
+            };
+
+            match unknown_import_behavior {
+                UnknownImportBehavior::LinkError => (),
+                UnknownImportBehavior::Trap => linker
+                    .define_unknown_imports_as_traps(&component)
+                    .map_err(anyhow::Error::from)?,
+            }
+
+            let instance_pre = linker
+                .instantiate_pre(&component)
+                .map_err(anyhow::Error::from)?;
+            Instance::Component(
+                component,
+                compute::bindings::AdapterServicePre::new(instance_pre)
+                    .map_err(anyhow::Error::from)?,
+            )
+        } else {
+            let mut linker = Linker::new(&engine);
+            link_host_functions(&mut linker, &wasi_modules)?;
+            let module = if is_wat {
+                Module::from_file(&engine, &module_path).map_err(anyhow::Error::from)?
+            } else {
+                Module::from_binary(&engine, &input).map_err(anyhow::Error::from)?
+            };
+
+            match unknown_import_behavior {
+                UnknownImportBehavior::LinkError => (),
+                UnknownImportBehavior::Trap => linker
+                    .define_unknown_imports_as_traps(&module)
+                    .map_err(anyhow::Error::from)?,
+            }
+
+            let instance_pre = linker
+                .instantiate_pre(&module)
+                .map_err(anyhow::Error::from)?;
+            Instance::Module(module, instance_pre)
+        };
+
+        // Create the epoch-increment thread. Note that the period for epoch
+        // interruptions is driven by the guest profiling sample period if
+        // provided as guest stack sampling is done from the epoch
+        // interruption callback.
+
+        let epoch_increment_stop = Arc::new(AtomicBool::new(false));
+        let engine_clone = engine.clone();
+        let epoch_increment_stop_clone = epoch_increment_stop.clone();
+        let sample_period = guest_profile_config
+            .as_ref()
+            .map(|c| c.sample_period)
+            .unwrap_or(DEFAULT_EPOCH_INTERRUPTION_PERIOD);
+        let epoch_increment_thread = Some(thread::spawn(move || {
+            while !epoch_increment_stop_clone.load(Ordering::Relaxed) {
+                thread::sleep(sample_period);
+                engine_clone.increment_epoch();
+            }
+        }));
+
+        Ok(Arc::new(ExecuteCtx {
+            engine,
+            instance_pre: Arc::new(instance_pre),
+            tls_config: TlsConfig::new()?,
+            next_req_id: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(Cache::default()),
+            pending_reuse: Arc::new(AsyncMutex::new(vec![])),
+            epoch_increment_thread,
+            epoch_increment_stop,
+            guest_profile_config: guest_profile_config.map(Arc::new),
+            settings,
+        }))
+    }
+
+    /// Set whether the guest should be compiled with native debug info, so that it can be
+    /// inspected with a native debugger.
+    ///
+    /// Defaults to `false`, as generating debug info both slows compilation down and requires the
+    /// guest to have been built with debug info of its own.
+    pub fn with_debug_info(mut self, debug_info: bool) -> Self {
+        self.debug_info = debug_info;
+        self
     }
 
     /// Set the acls for this execution context.
     pub fn with_acls(mut self, acls: Acls) -> Self {
-        self.inner.acls = acls;
+        self.settings.acls = acls;
         self
     }
 
     /// Set the backends for this execution context.
     pub fn with_backends(mut self, backends: Backends) -> Self {
-        self.inner.backends = backends;
+        self.settings.backends = backends;
         self
     }
 
     /// Set the device detection mappings for this execution context.
     pub fn with_device_detection(mut self, device_detection: DeviceDetection) -> Self {
-        self.inner.device_detection = device_detection;
+        self.settings.device_detection = device_detection;
         self
     }
 
     /// Set the geolocation mappings for this execution context.
     pub fn with_geolocation(mut self, geolocation: Geolocation) -> Self {
-        self.inner.geolocation = geolocation;
+        self.settings.geolocation = geolocation;
         self
     }
 
     /// Set the dictionaries for this execution context.
     pub fn with_dictionaries(mut self, dictionaries: Dictionaries) -> Self {
-        self.inner.dictionaries = dictionaries;
+        self.settings.dictionaries = dictionaries;
         self
     }
 
     /// Set the object store for this execution context.
     pub fn with_object_stores(mut self, object_store: ObjectStores) -> Self {
-        self.inner.object_store = object_store;
+        self.settings.object_store = object_store;
         self
     }
 
     /// Set the secret stores for this execution context.
     pub fn with_secret_stores(mut self, secret_stores: SecretStores) -> Self {
-        self.inner.secret_stores = secret_stores;
+        self.settings.secret_stores = secret_stores;
         self
     }
     /// Set the shielding sites for this execution context.
     pub fn with_shielding_sites(mut self, shielding_sites: ShieldingSites) -> Self {
-        self.inner.shielding_sites = shielding_sites;
+        self.settings.shielding_sites = shielding_sites;
         self
     }
 
@@ -1114,45 +1238,54 @@ impl ExecuteCtxBuilder {
         mut self,
         fake_valid_fastly_keys: FakeValidFastlyKeys,
     ) -> Self {
-        self.inner.fake_valid_fastly_keys = fake_valid_fastly_keys;
+        self.settings.fake_valid_fastly_keys = fake_valid_fastly_keys;
         self
     }
 
     /// Set the path to the config for this execution context.
     pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
-        self.inner.config_path = Some(config_path);
+        self.settings.config_path = Some(config_path);
         self
     }
 
     /// Set where to direct logging endpoint messages for this execution
     /// context. Defaults to stdout.
     pub fn with_capture_logs(mut self, capture_logs: Arc<Mutex<dyn Write + Send>>) -> Self {
-        self.inner.capture_logs = capture_logs;
+        self.settings.capture_logs = capture_logs;
         self
     }
 
     /// Set the stdout logging policy for this execution context.
     pub fn with_log_stdout(mut self, log_stdout: bool) -> Self {
-        self.inner.log_stdout = log_stdout;
+        self.settings.log_stdout = log_stdout;
         self
     }
 
     /// Set the stderr logging policy for this execution context.
     pub fn with_log_stderr(mut self, log_stderr: bool) -> Self {
-        self.inner.log_stderr = log_stderr;
+        self.settings.log_stderr = log_stderr;
         self
     }
 
     /// Set the local Pushpin proxy port
     pub fn with_local_pushpin_proxy_port(mut self, local_pushpin_proxy_port: Option<u16>) -> Self {
-        self.inner.local_pushpin_proxy_port = local_pushpin_proxy_port;
+        self.settings.local_pushpin_proxy_port = local_pushpin_proxy_port;
+        self
+    }
+
+    /// Set whether WebSocket passthrough is enabled for this execution context.
+    pub fn with_enable_local_websocket_passthrough(
+        mut self,
+        enable_local_websocket_passthrough: bool,
+    ) -> Self {
+        self.settings.enable_local_websocket_passthrough = enable_local_websocket_passthrough;
         self
     }
 }
 
 fn write_profile_to_file(profile: Box<GuestProfiler>, path: &PathBuf) {
     match std::fs::File::create(path)
-        .map_err(anyhow::Error::new)
+        .map_err(wasmtime::Error::new)
         .and_then(|output| profile.finish(std::io::BufWriter::new(output)))
     {
         Err(e) => {
@@ -1191,23 +1324,23 @@ fn write_profile_component(
     }
 }
 
-fn guest_result_to_response(resp: Response<Body>, err: Option<anyhow::Error>) -> Response<Body> {
-    err.as_ref().map(anyhow_response).unwrap_or(resp)
+fn guest_result_to_response(resp: Response<Body>, err: Option<wasmtime::Error>) -> Response<Body> {
+    err.as_ref().map(err_response).unwrap_or(resp)
 }
 
 fn exec_err_to_response(err: &ExecutionError) -> Response<Body> {
     if let ExecutionError::WasmTrap(e) = err {
-        anyhow_response(e)
+        err_response(e)
     } else {
         panic!("failed to run guest: {err}")
     }
 }
 
-fn anyhow_response(err: &anyhow::Error) -> Response<Body> {
-    anyhow_response_with_status(err, hyper::StatusCode::INTERNAL_SERVER_ERROR)
+fn err_response(err: &wasmtime::Error) -> Response<Body> {
+    err_response_with_status(err, hyper::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn anyhow_response_with_status(err: &anyhow::Error, status: hyper::StatusCode) -> Response<Body> {
+fn err_response_with_status(err: &wasmtime::Error, status: hyper::StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
         .body(Body::from(format!("{err:?}").into_bytes()))
@@ -1226,13 +1359,15 @@ impl Drop for ExecuteCtx {
 fn configure_wasmtime(
     wasm_features: WasmFeatures,
     profiling_strategy: ProfilingStrategy,
+    debug_info: bool,
 ) -> wasmtime::Config {
     use wasmtime::{Config, InstanceAllocationStrategy, WasmBacktraceDetails};
 
     let mut config = Config::new();
-    config.debug_info(false); // Keep this disabled - wasmtime will hang if enabled
+    // Off by default: translating the guest's DWARF into native debug info costs compile time,
+    // and is only useful when the guest was built with debug info to begin with.
+    config.debug_info(debug_info);
     config.wasm_backtrace_details(WasmBacktraceDetails::Enable);
-    config.async_support(true);
     config.epoch_interruption(true);
     config.profiler(profiling_strategy);
 
@@ -1248,6 +1383,10 @@ fn configure_wasmtime(
     // that it works consistently even if the initialization runs on a
     // different host architecture.
     config.relaxed_simd_deterministic(true);
+
+    // Enable the wide-arithmetic feature, which has now been voted
+    // to phase-4.
+    config.wasm_wide_arithmetic(true);
 
     config
 }
@@ -1278,5 +1417,75 @@ impl<E, F: Future<Output = Result<(), E>>> Future for CpuTimeTracking<F> {
         let runtime = start.elapsed().as_micros() as u64;
         let _ = me.time_spent.fetch_add(runtime, Ordering::SeqCst);
         result
+    }
+}
+
+/// Formats bytes as a human-readable string in IEC
+/// format (e.g. 1.0 MiB), always to one decimal place.
+struct ByteFormatter(usize);
+
+impl fmt::Display for ByteFormatter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // very unlikely for allocated wasm memory to go up to TiB so that's where we stop
+        let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+        // get the exponent
+        // we could do this with a logarithm, but this
+        // is simpler to read and we'll have at most 4 iterations anyway
+        let mut exp = 0;
+        let mut value = self.0 as f64;
+
+        // The bound is 1023.95 rather than 1024, because the mantissa is
+        // rounded to one decimal place when printed and anything above that
+        // rounds to "1024.0", which belongs in the next unit up: 1048575 bytes
+        // is 1023.999 KiB, and should read "1.0 MiB".
+        while value >= 1024.0 - 0.05 && exp < units.len() - 1 {
+            value /= 1024.0;
+            exp += 1;
+        }
+
+        write!(f, "{value:.1} {}", units[exp])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::execute::ByteFormatter;
+
+    #[test]
+    fn test_byte_formatter() {
+        let tests = [
+            (0, "0.0 B"),
+            (1, "1.0 B"),
+            (1023, "1023.0 B"),
+            (1024, "1.0 KiB"),
+            (1536, "1.5 KiB"),
+            (1048576, "1.0 MiB"),
+            (1572864, "1.5 MiB"),
+            (1073741824, "1.0 GiB"),
+            (1610612736, "1.5 GiB"),
+            (1099511627776, "1.0 TiB"),
+            // Just below a unit boundary. Rounding the mantissa to one decimal
+            // place takes these up to 1024, which belongs in the next unit.
+            (1048575, "1.0 MiB"),
+            (1073741823, "1.0 GiB"),
+            (1099511627775, "1.0 TiB"),
+            // 1048524 is 1023.949 KiB and 1048525 is 1023.950 KiB, so the pair
+            // brackets the point where rounding first reaches the boundary.
+            (1048524, "1023.9 KiB"),
+            (1048525, "1.0 MiB"),
+        ];
+
+        for (bytes, expected) in tests {
+            let formatter = ByteFormatter(bytes);
+            assert_eq!(formatter.to_string(), expected, "for {bytes} bytes");
+        }
+    }
+
+    /// TiB is the largest unit, so there is nothing to carry into and a
+    /// mantissa above 1024 is the intended result rather than a bug.
+    #[test]
+    fn test_byte_formatter_saturates_at_largest_unit() {
+        assert_eq!(ByteFormatter(1125899906842624).to_string(), "1024.0 TiB");
     }
 }

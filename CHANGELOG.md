@@ -1,5 +1,76 @@
 ## Unreleased
 
+- Fix `async_io` test.
+  See [#286](https://github.com/fastly/Viceroy/issues/286).
+  ([#739](https://github.com/fastly/Viceroy/pull/739))
+
+- Report NotFound for delete_wait of missing key.
+  See [#722](https://github.com/fastly/Viceroy/issues/722).
+  ([#736](https://github.com/fastly/Viceroy/pull/736))
+
+- Restore clippy linting in CI. ([#737](https://github.com/fastly/Viceroy/pull/737))
+
+- Build the WASI p1-to-p2 component adapter automatically, instead of checking in non-reproducible
+  binaries that risk going stale. Now we compile them using a build script and release packaging
+  ensures they're present for `cargo package`. Building `viceroy-lib` from crates.io still needs
+  no wasm toolchain, since the binaries are built at publish time and included in the package.
+  See [#536](https://github.com/fastly/Viceroy/issues/536).
+
+- Update to Wasmtime 46. ([#642](https://github.com/fastly/Viceroy/pull/642))
+- Implement the synchronous kv-store WIT API. ([#702](https://github.com/fastly/Viceroy/pull/702))
+
+- Return an empty result from `geo.lookup` on the component ABI for an address without geolocation
+  data, instead of erroring. This matches the witx ABI and the Compute platform.
+  See [#721](https://github.com/fastly/Viceroy/issues/721).
+
+## 0.21.1 (2026-09-15)
+
+- Support generating native debug info for the guest, via the new `-g`/`--debug-info` flag and
+  `ExecuteCtxBuilder::with_debug_info`, so that guests can be inspected with `lldb` or `gdb`. This
+  remains off by default: it costs compile time and only helps when the guest itself was built with
+  debug info. See [#52](https://github.com/fastly/Viceroy/issues/52).
+  ([#708](https://github.com/fastly/Viceroy/pull/708))
+
+- Map a body read that ends early to `error.http-incomplete` on the component ABI, which previously
+  answered `error.generic-error` even though the witx ABI mapped it. A truncated body does not
+  satisfy `hyper::Error::is_incomplete_message`, so the cause needs a downcast, and the component
+  mapping had no equivalent of the one in `src/error.rs`. See [#289](https://github.com/fastly/Viceroy/issues/289).
+
+- Avoid using bindings::sync functions in WASI implementations. ([#700](https://github.com/fastly/Viceroy/pull/700))
+- Implement cache_override_v3_set in the component adapter. ([#703](https://github.com/fastly/Viceroy/pull/703))
+- Update to the latest WITs. ([#701](https://github.com/fastly/Viceroy/pull/701))
+- Update test-fixtures to fastly 0.13.1. ([#707](https://github.com/fastly/Viceroy/pull/707))
+- Internal unification of native/guest profiling config. (#[597](https://github.com/fastly/Viceroy/pull/597))
+- Remove the warning about Wasm Component support. ([#709](https://github.com/fastly/Viceroy/pull/709))
+
+## 0.21.0 (2026-08-25)
+
+- Enable support for the wide-arithmetic feature. ([#679](https://github.com/fastly/Viceroy/pull/679))
+
+- Implement `backend.get-host` on the component ABI, which previously always returned
+  `error.unsupported` even though the witx ABI implemented it, and report the required buffer
+  length from the component `get-host`/`get-override-host` accessors. ([#677](https://github.com/fastly/Viceroy/pull/677))
+
+- Report Fanout as `unsupported` to the guest when it is not enabled, instead of failing after
+  the guest has returned.
+
+  Previously, calling `redirect_to_grip_proxy` (or `_v2`) without
+  `--local-pushpin-proxy-port` succeeded from the guest's point of view, and Viceroy then
+  generated a plain-text 500 that the guest had no part in producing. The hostcall now returns
+  `FastlyStatus::Unsupported` before the handoff is signaled, matching the behavior of a
+  deployed service that does not have Fanout enabled, so that SDK-level error handling can run.
+  ([#678](https://github.com/fastly/Viceroy/pull/678))
+
+- Add `--enable-local-websocket-passthrough=<true|false>` (default `true`), to simulate a
+  service that does not have the WebSockets feature enabled.
+
+  When set to `false`, `redirect_to_websocket_proxy` (and `_v2`) reports
+  `FastlyStatus::Unsupported` to the guest rather than proxying the request, which makes the
+  "WebSockets not enabled" path testable locally for the first time.
+  ([#678](https://github.com/fastly/Viceroy/pull/678))
+
+- Future-proofed cache override hostcall ([#659](https://github.com/fastly/Viceroy/pull/659))
+
 ## 0.20.1 (2026-07-16)
 
 - Fix wiggle abi implementation for bot detection mocking. ([#664](https://github.com/fastly/Viceroy/pull/664))
@@ -8,7 +79,6 @@
 
 - Always use an `unsafe` block to `unsafe_main_ptr`. ([#643](https://github.com/fastly/Viceroy/pull/643))
 - Add support for healthchecking dynamic backends ([#635](https://github.com/fastly/Viceroy/pull/635))
-- Add support for headers-based bot detection mocking, as well as headless bots in the API, updated to v0.13.0 of Fastly crate ([#658](https://github.com/fastly/Viceroy/pull/658))
 
 ## 0.19.0 (2026-06-16)
 
